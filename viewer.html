@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Orbit Wars Replay Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #212121; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; }
+  #app { display: flex; flex-direction: column; align-items: center; width: 100%; max-width: 860px; padding: 12px; gap: 8px; }
+  #header { width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 0 8px; font-size: 14px; border-bottom: 2px solid #333; padding-bottom: 8px; }
+  #header a { color: #1ebeff; text-decoration: none; }
+  #viewer { width: 100%; aspect-ratio: 1; background: #1c1d20; position: relative; display: flex; align-items: center; justify-content: center; border: 2px solid #333; border-radius: 4px; }
+  #viewer canvas { display: block; max-width: 100%; max-height: 100%; }
+  #legend { width: 100%; display: flex; justify-content: center; gap: 24px; padding: 6px 0; font-size: 14px; min-height: 36px; align-items: center; }
+  #legend li { display: flex; align-items: center; gap: 6px; list-style: none; }
+  #legend .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+  #controls { width: 100%; display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 2px solid #333; }
+  #playBtn { background: none; border: none; color: #fff; cursor: pointer; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; opacity: .8; flex-shrink: 0; }
+  #playBtn:hover { opacity: 1; }
+  #playBtn svg { width: 24px; height: 24px; fill: #fff; }
+  #stepSlider { flex: 1; appearance: none; height: 4px; border-radius: 2px; background: rgba(255,255,255,.15); outline: none; cursor: pointer; }
+  #stepSlider::-webkit-slider-thumb { appearance: none; width: 12px; height: 12px; border-radius: 50%; background: #1ebeff; cursor: pointer; }
+  #stepSlider::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #1ebeff; cursor: pointer; border: none; }
+  #stepCount { font-size: 14px; opacity: .8; white-space: nowrap; flex-shrink: 0; min-width: 80px; text-align: center; }
+  #speedBtns { display: flex; gap: 4px; flex-shrink: 0; }
+  #speedBtns button { background: none; border: 1px solid #555; color: #aaa; padding: 4px 8px; border-radius: 3px; cursor: pointer; font-size: 11px; }
+  #speedBtns button:hover { border-color: #1ebeff; color: #fff; }
+  #speedBtns button.active { border-color: #1ebeff; color: #1ebeff; background: rgba(30,190,255,.1); }
+  #loadArea { width: 100%; display: flex; align-items: center; gap: 12px; padding: 4px 0; }
+  #loadBtn { background: #1ebeff; color: #000; border: none; padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: bold; }
+  #loadBtn:hover { background: #4acbff; }
+  #fileName { font-size: 13px; opacity: .7; }
+  #placeholder { color: #666; font-size: 18px; text-align: center; padding: 40px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="header">
+    <span>Orbit Wars</span>
+    <span style="opacity:.5;font-size:12px">click <b>Load Replay</b> to open a .json file</span>
+  </div>
+  <div id="viewer">
+    <div id="placeholder">Load a replay file to view</div>
+  </div>
+  <div id="legend"></div>
+  <div id="loadArea">
+    <button id="loadBtn">Load Replay</button>
+    <span id="fileName"></span>
+    <input type="file" id="fileInput" accept=".json" style="display:none">
+  </div>
+  <div id="controls" class="hidden">
+    <button id="playBtn">
+      <svg viewBox="0 0 24 24"><path id="playIcon" d="M8 5v14l11-7z"/></svg>
+    </button>
+    <input type="range" id="stepSlider" min="0" max="0" value="0">
+    <span id="stepCount">0 / 0</span>
+    <div id="speedBtns">
+      <button data-speed="0.25">¼×</button>
+      <button data-speed="0.5">½×</button>
+      <button data-speed="1" class="active">1×</button>
+      <button data-speed="2">2×</button>
+      <button data-speed="4">4×</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // --- Renderer (adapted from kaggle_environments/envs/orbit_wars/orbit_wars.js) ---
+  function renderer(context) {
+    const { environment, frame, height, width, parent, step } = context;
+    let canvas = parent.querySelector("canvas");
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      parent.appendChild(canvas);
+    }
+    const c = canvas.getContext("2d");
+    const size = Math.min(width, height);
+    canvas.width = size;
+    canvas.height = size;
+    c.clearRect(0, 0, canvas.width, canvas.height);
+    const scale = size / 100;
+
+    function drawCircle(x, y, r, color, fill) {
+      c.beginPath();
+      c.arc(x * scale, y * scale, r * scale, 0, 2 * Math.PI);
+      c.fillStyle = color;
+      c.strokeStyle = color;
+      c.lineWidth = 2;
+      fill ? c.fill() : c.stroke();
+    }
+
+    function drawText(text, x, y, color, sizePt) {
+      c.font = `${(sizePt * scale) / 4}px sans-serif`;
+      c.fillStyle = color;
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.fillText(text, x * scale, y * scale);
+    }
+
+    c.fillStyle = "#000";
+    c.fillRect(0, 0, canvas.width, canvas.height);
+
+    const sunX = 50 * scale, sunY = 50 * scale, sunR = 10 * scale;
+    const glow = c.createRadialGradient(sunX, sunY, sunR * 0.5, sunX, sunY, sunR * 2.5);
+    glow.addColorStop(0, "rgba(255,200,50,0.6)");
+    glow.addColorStop(0.5, "rgba(255,150,20,0.2)");
+    glow.addColorStop(1, "rgba(255,100,0,0)");
+    c.fillStyle = glow;
+    c.fillRect(0, 0, canvas.width, canvas.height);
+    drawCircle(50, 50, 10, "#FFB800", true);
+    drawCircle(50, 50, 10, "#FFD700", false);
+
+    const currentStep = environment.steps[step];
+    if (!currentStep) return;
+    const obs = currentStep[0].observation;
+    if (!obs) return;
+
+    const colors = ["#0072B2", "#D55E00", "#009E73", "#F0E442", "#888888"];
+
+    const cometPidSet = new Set(obs.comet_planet_ids || []);
+    if (obs.comets) {
+      obs.comets.forEach((group) => {
+        const idx = group.path_index;
+        group.planet_ids.forEach((pid, i) => {
+          const path = group.paths[i];
+          const tailLen = Math.min(idx + 1, path.length, 3);
+          if (tailLen < 2) return;
+          for (let t = 1; t < tailLen; t++) {
+            const pi = idx - t;
+            if (pi < 0) break;
+            const alpha = 0.5 * (1 - t / tailLen);
+            const x0 = path[pi][0] * scale;
+            const y0 = path[pi][1] * scale;
+            const x1 = path[pi + 1][0] * scale;
+            const y1 = path[pi + 1][1] * scale;
+            const w = (3 - (2 * t) / tailLen) * scale;
+            c.beginPath();
+            c.moveTo(x1, y1);
+            c.lineTo(x0, y0);
+            c.strokeStyle = `rgba(200,220,255,${alpha})`;
+            c.lineWidth = w;
+            c.lineCap = "round";
+            c.stroke();
+          }
+        });
+      });
+    }
+
+    if (obs.planets) {
+      obs.planets.forEach((p) => {
+        const id = p[0], owner = p[1], x = p[2], y = p[3], r = p[4], ships = p[5];
+        const color = owner === -1 ? colors[4] : colors[owner];
+        drawCircle(x, y, r, color, true);
+        if (cometPidSet.has(id)) drawCircle(x, y, r, "#FFF", false);
+        drawText(Math.floor(ships).toString(), x, y, "#FFF", 12);
+      });
+    }
+
+    if (obs.fleets) {
+      obs.fleets.forEach((f) => {
+        const owner = f[1], x = f[2] * scale, y = f[3] * scale, angle = f[4], ships = f[6];
+        const color = colors[owner];
+        const sz = (0.5 + (2.5 * Math.log(ships)) / Math.log(1000)) * scale;
+        c.save();
+        c.translate(x, y);
+        c.rotate(angle);
+        c.beginPath();
+        c.moveTo(sz, 0);
+        c.lineTo(-sz, -sz * 0.7);
+        c.lineTo(-sz * 0.3, 0);
+        c.lineTo(-sz, sz * 0.7);
+        c.closePath();
+        c.fillStyle = color;
+        c.fill();
+        c.strokeStyle = "rgba(255,255,255,0.55)";
+        c.lineWidth = sz * 0.15;
+        c.lineCap = "round";
+        if (owner === 1 || owner === 3) {
+          c.beginPath(); c.moveTo(sz * 0.8, 0); c.lineTo(-sz * 0.2, 0); c.stroke();
+        }
+        if (owner === 2 || owner === 3) {
+          c.beginPath(); c.moveTo(sz * 0.6, -sz * 0.15); c.lineTo(-sz * 0.7, -sz * 0.5); c.stroke();
+          c.beginPath(); c.moveTo(sz * 0.6, sz * 0.15); c.lineTo(-sz * 0.7, sz * 0.5); c.stroke();
+        }
+        c.restore();
+        const labelOffset = f[3] >= 50 ? -3 : 3;
+        drawText(ships.toString(), f[2], f[3] + labelOffset, color, 8);
+      });
+    }
+
+    c.fillStyle = "#FFF";
+    c.font = "16px sans-serif";
+    c.textAlign = "left";
+    c.textBaseline = "top";
+    c.fillText("Step: " + step, 10, 10);
+  }
+
+  // --- App state ---
+  let steps = [];
+  let step = 0;
+  let playing = false;
+  let animTimer = null;
+  let speed = 1; // multiplier, base interval = 333ms
+  const baseInterval = 333;
+
+  const viewer = document.getElementById("viewer");
+  const placeholder = document.getElementById("placeholder");
+  const controls = document.getElementById("controls");
+  const playBtn = document.getElementById("playBtn");
+  const playIcon = document.getElementById("playIcon");
+  const stepSlider = document.getElementById("stepSlider");
+  const stepCount = document.getElementById("stepCount");
+  const legend = document.getElementById("legend");
+  const fileInput = document.getElementById("fileInput");
+  const loadBtn = document.getElementById("loadBtn");
+  const fileName = document.getElementById("fileName");
+  const speedBtns = document.querySelectorAll("#speedBtns button");
+
+  // --- Render ---
+  function render() {
+    if (steps.length === 0) return;
+    const rect = viewer.getBoundingClientRect();
+    const w = Math.max(rect.width - 4, 100);
+    const h = Math.max(rect.height - 4, 100);
+    renderer({
+      environment: { steps },
+      step,
+      frame: 1,
+      height: h,
+      width: w,
+      parent: viewer,
+    });
+  }
+
+  function updateUI() {
+    stepSlider.max = Math.max(steps.length - 1, 0);
+    stepSlider.value = step;
+    stepCount.textContent = `${step + 1} / ${steps.length}`;
+    playIcon.setAttribute("d", playing ? "M6 19h4V5H6v14zm8-14v14h4V5h-4z" : "M8 5v14l11-7z");
+  }
+
+  function setStep(val) {
+    step = Math.max(0, Math.min(val, steps.length - 1));
+    render();
+    updateUI();
+  }
+
+  // --- Playback ---
+  function playNext() {
+    if (!playing) return;
+    if (step < steps.length - 1) {
+      setStep(step + 1);
+      const interval = baseInterval / speed;
+      animTimer = setTimeout(playNext, interval);
+    } else {
+      pause();
+    }
+  }
+
+  function play() {
+    if (playing) return;
+    if (step >= steps.length - 1) setStep(0);
+    playing = true;
+    updateUI();
+    const interval = baseInterval / speed;
+    animTimer = setTimeout(playNext, interval);
+  }
+
+  function pause() {
+    playing = false;
+    if (animTimer) { clearTimeout(animTimer); animTimer = null; }
+    updateUI();
+  }
+
+  function togglePlay() { playing ? pause() : play(); }
+
+  // --- Load file ---
+  function loadReplay(data) {
+    pause();
+    steps = data;
+    step = 0;
+    placeholder.classList.add("hidden");
+    controls.classList.remove("hidden");
+    if (steps.length > 0) {
+      // Build legend
+      const first = steps[0];
+      const colors = ["#0072B2", "#D55E00", "#009E73", "#F0E442"];
+      let html = "";
+      first.forEach((s, i) => {
+        if (i < 4) {
+          html += `<li><span class="dot" style="background:${colors[i]}"></span>Player ${i}${s.actor ? " (" + s.actor + ")" : ""}</li>`;
+        }
+      });
+      legend.innerHTML = html;
+    }
+    setStep(0);
+  }
+
+  loadBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    fileName.textContent = file.name;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        if (Array.isArray(data)) {
+          loadReplay(data);
+        } else {
+          alert("Invalid replay file: expected an array of steps.");
+        }
+      } catch (err) {
+        alert("Error parsing JSON: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    fileInput.value = "";
+  });
+
+  // --- Controls ---
+  playBtn.addEventListener("click", togglePlay);
+  stepSlider.addEventListener("input", () => {
+    if (playing) pause();
+    setStep(parseInt(stepSlider.value));
+  });
+
+  speedBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      speedBtns.forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      speed = parseFloat(btn.dataset.speed);
+      if (playing) {
+        pause();
+        play();
+      }
+    });
+  });
+
+  // --- Keyboard ---
+  window.addEventListener("keydown", (e) => {
+    const key = e.key;
+    if (key === " ") { e.preventDefault(); togglePlay(); return; }
+    if (key === "ArrowRight") { e.preventDefault(); if (playing) pause(); setStep(step + 1); return; }
+    if (key === "ArrowLeft") { e.preventDefault(); if (playing) pause(); setStep(step - 1); return; }
+    const k = parseInt(key);
+    if (k >= 0 && k <= 4) {
+      speedBtns.forEach((b) => {
+        b.classList.toggle("active", parseFloat(b.dataset.speed) === k || (k === 1 && parseFloat(b.dataset.speed) === 1));
+      });
+      const speeds = [0.25, 0.5, 1, 2, 4];
+      speed = speeds[k] || 1;
+      if (playing) { pause(); play(); }
+    }
+  });
+
+  // --- Resize ---
+  let resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(render, 100);
+  });
+
+  // Observe viewer size changes
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => render());
+    ro.observe(viewer);
+  }
+
+  // Initial render if somehow steps exist (not, but safe)
+  if (steps.length) render();
+})();
+</script>
+</body>
+</html>
