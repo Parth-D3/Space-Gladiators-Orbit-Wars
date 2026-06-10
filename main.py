@@ -18,6 +18,8 @@ Key concepts demonstrated:
 import math
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 
+from utils import compute_attack_angle
+
 
 def agent(obs):
     moves = []
@@ -53,8 +55,13 @@ def agent(obs):
 
         # Only launch if we can afford it — otherwise keep accumulating
         if mine.ships >= ships_needed:
-            # atan2(dy, dx) gives the angle from our planet to the target
-            angle = math.atan2(nearest.y - mine.y, nearest.x - mine.x)
-            moves.append([mine.id, angle, ships_needed])
+            angle = compute_attack_angle(
+                mine, nearest, ships_needed, planets,
+                obs.get("initial_planets", []),
+                obs.get("angular_velocity", 0),
+                obs.get("step", 0),
+            )
+            if angle != -1.0:
+                moves.append([mine.id, angle, ships_needed])
 
     return moves
