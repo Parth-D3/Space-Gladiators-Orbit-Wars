@@ -18,11 +18,12 @@ Reward (computed from observations, see ow_features.totals):
 Usage:
     python train_ppo.py --total-steps 300000          # train
     python train_ppo.py --eval 20                     # evaluate exported npz
-    python train_ppo.py --resume ppo_orbitwars.pt ... # continue training
+    python train_ppo.py --resume ppo_orbitwars_mlp.pt ... # continue training
 """
 
 import argparse
 import collections
+import math
 import os
 import random
 import time
@@ -30,6 +31,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from kaggle_environments import make
 
@@ -166,7 +168,7 @@ class Runner:
     @torch.no_grad()
     def rollout(self, n_steps):
         B = dict(P=[], G=[], sm=[], tm=[], a=[], logp=[], val=[], rew=[], done=[])
-        for _ in range(n_steps):
+        for _ in tqdm(range(n_steps), desc="Rollout", leave=False):
             P, G, sm, tm, aux = self.state
             tP, tG, tsm, ttm = self._tensors(self.state)
             ds, dt_, df, v = self.model.dists(tP, tG, tsm, ttm)
@@ -229,9 +231,10 @@ def ppo_update(model, optimizer, B, adv, ret, args, device):
     ADV = (ADV - ADV.mean()) / (ADV.std() + 1e-8)
 
     idx = np.arange(N)
-    pl = vl = ent = 0.0
-    for _ in range(args.epochs):
+    for epoch in range(args.epochs):
         np.random.shuffle(idx)
+        pl_acc = vl_acc = ent_acc = 0.0
+        n_mb = 0
         for s in range(0, N, args.minibatch):
             b = torch.as_tensor(idx[s:s + args.minibatch], device=device)
             ds, dt_, df, v = model.dists(P[b], G[b], SM[b], TM[b])
@@ -248,8 +251,11 @@ def ppo_update(model, optimizer, B, adv, ret, args, device):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
-            pl, vl, ent = policy_loss.item(), value_loss.item(), entropy.item()
-    return pl, vl, ent
+            pl_acc += policy_loss.item()
+            vl_acc += value_loss.item()
+            ent_acc += entropy.item()
+            n_mb += 1
+    return pl_acc / n_mb, vl_acc / n_mb, ent_acc / n_mb
 
 
 # ------------------------------ evaluation ----------------------------------
@@ -302,8 +308,8 @@ def parse_args():
                     help="disable the scripted low-garrison reinforcement rule")
     ap.add_argument("--overflow-cap", type=int, default=300,
                     help="garrisons above this MUST attack (0 disables)")
-    ap.add_argument("--ckpt", type=str, default="ppo_orbitwars.pt")
-    ap.add_argument("--out", type=str, default="ppo_weights.npz",
+    ap.add_argument("--ckpt", type=str, default="ppo_orbitwars_mlp.pt")
+    ap.add_argument("--out", type=str, default="ppo_mlp_weights.npz",
                     help="numpy weights consumed by main.py")
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--eval", type=int, default=0, help="evaluate N games and exit")
@@ -326,9 +332,10 @@ def main():
 
     device = torch.device(args.device)
     model = TorchPolicy().to(device)
-    if args.resume and os.path.exists(args.resume):
-        model.load_state_dict(torch.load(args.resume, map_location=device))
-        print(f"resumed from {args.resume}")
+    resume_path = args.resume or args.ckpt
+    if os.path.exists(resume_path):
+        model.load_state_dict(torch.load(resume_path, map_location=device))
+        print(f"resumed from {resume_path}")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     runner = Runner(Game(args.opponent, players=players), model, device,
@@ -339,6 +346,7 @@ def main():
           f"| auto_defend={auto_defend} "
           f"({sum(p.numel() for p in model.parameters()):,} params)")
 
+    pbar = tqdm(total=args.total_steps, desc="Training", unit="step")
     while steps < args.total_steps:
         B, v_last = runner.rollout(args.rollout)
         adv, ret = compute_gae(B["rew"], B["val"], B["done"], v_last, args.gamma, args.lam)
@@ -354,10 +362,16 @@ def main():
         winrate = (sum(1 for r in res if r == 1) / len(res)) if res else float("nan")
         mean_ret = np.mean(runner.ep_returns) if runner.ep_returns else float("nan")
         sps = steps / (time.time() - t0)
+        pbar.set_postfix(upd=update, win=f"{winrate:.0%}" if not math.isnan(winrate) else "N/A",
+                         ret=f"{mean_ret:+.2f}" if not math.isnan(mean_ret) else "N/A",
+                         pi=f"{pl:+.3f}", vl=f"{vl:.3f}", ent=f"{ent:.2f}",
+                         sps=f"{sps:,.0f}")
+        pbar.update(args.rollout)
         print(f"upd {update:4d} | steps {steps:>8,} | eps {runner.episodes:4d} "
               f"| winrate(last{len(res)}) {winrate:5.0%} | ep_ret {mean_ret:+7.2f} "
               f"| pi {pl:+.3f} v {vl:.3f} ent {ent:.2f} | {sps:,.0f} steps/s")
 
+    pbar.close()
     print(f"done. saved {args.ckpt} and {args.out}")
 
 
