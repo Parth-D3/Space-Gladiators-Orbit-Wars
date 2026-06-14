@@ -32,7 +32,7 @@ SUN_MARGIN = 1.0           # extra clearance when checking sun-blocked launches
 
 # ----- encoding sizes (fixed-size tensors for the neural net) -----
 MAX_PLANETS = 64           # README: 20-40 planets + comets (groups of 4)
-PLANET_F = 17              # per-planet features (incl. velocity vx, vy)
+PLANET_F = 22              # per-planet features (incl. velocity vx, vy, fleet-threat)
 GLOBAL_F = 13              # global features
 FRACS = (0.0, 0.25, 0.5, 0.75, 1.0)   # garrison fraction to send (0 = no-op)
 NFRAC = len(FRACS)
@@ -133,6 +133,38 @@ def encode(obs):
     rows = rows[:MAX_PLANETS]
 
     P = np.zeros((MAX_PLANETS, PLANET_F), dtype=np.float32)
+
+    # Fleet-threat features: angular alignment (cosine > 0.95 ≈ 18° cone)
+    planet_by_id = {r["id"]: r for r in rows}
+    incoming_h = np.zeros(MAX_PLANETS, dtype=np.float32)
+    incoming_a = np.zeros(MAX_PLANETS, dtype=np.float32)
+    min_eta = np.full(MAX_PLANETS, 50.0, dtype=np.float32)
+    max_eta = np.zeros(MAX_PLANETS, dtype=np.float32)
+    COS_THRESH = 0.95
+
+    for f in fleets:
+        src = planet_by_id.get(f["src"])
+        if src is None:
+            continue
+        fx = math.cos(f["angle"])
+        fy = math.sin(f["angle"])
+        for i, r in enumerate(rows):
+            if r["id"] == src["id"]:
+                continue
+            dx = r["x"] - src["x"]
+            dy = r["y"] - src["y"]
+            dist = math.hypot(dx, dy)
+            if dist < 0.01:
+                continue
+            if (dx * fx + dy * fy) / dist > COS_THRESH:
+                eta_val = dist / max(fleet_speed(f["ships"]), 0.1)
+                if f["owner"] == player:
+                    incoming_a[i] += f["ships"]
+                else:
+                    incoming_h[i] += f["ships"]
+                    if eta_val < min_eta[i]: min_eta[i] = eta_val
+                    if eta_val > max_eta[i]: max_eta[i] = eta_val
+
     for i, r in enumerate(rows):
         mine = 1.0 if r["owner"] == player else 0.0
         enemy = 1.0 if (r["owner"] != player and r["owner"] != -1) else 0.0
@@ -175,6 +207,11 @@ def encode(obs):
             math.log1p(near_m) / _LOG1K,
             vx / 4.0,                     # cometSpeed default 4 = fastest object
             vy / 4.0,
+            math.log1p(incoming_h[i]) / _LOG1K,
+            math.log1p(incoming_a[i]) / _LOG1K,
+            min(min_eta[i], 50.0) / 50.0,
+            min(max_eta[i], 50.0) / 50.0,
+            math.tanh((r["ships"] + incoming_a[i] - incoming_h[i]) / 200.0),
         )
 
     myp = [r for r in rows if r["owner"] == player]
