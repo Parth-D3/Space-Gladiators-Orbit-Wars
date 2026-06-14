@@ -1,92 +1,51 @@
 """
 Utility module for orbital path calculations in Orbit Wars.
 
-Provides:
-  compute_attack_angle — compute launch angle accounting for orbiting
-    targets, sun/OOB/obstacle avoidance. Returns -1.0 if unreachable.
+Provides compute_attack_angle — launch angle computation with
+configurable parameters, comet support, and safety checks.
 """
 
 import math
 
-# Engine constants (matching kaggle_environments.envs.orbit_wars)
 CENTER = 50.0
-SUN_RADIUS = 10.0
-BOARD_SIZE = 100.0
 ROTATION_RADIUS_LIMIT = 50.0
-DEFAULT_MAX_SPEED = 6.0
-MAX_ITER = 6
-CONVERGENCE_THRESHOLD = 1e-6
+_LOG1K = math.log(1000.0)
+
+DEFAULT_CONFIG = {
+    "shipSpeed": 6.0,
+    "sunRadius": 10.0,
+    "boardSize": 100.0,
+    "cometSpeed": 4.0,
+}
 
 
-def compute_fleet_speed(ships, max_speed=DEFAULT_MAX_SPEED):
-    """Fleet speed based on ship count, matching engine formula.
+def get_config(config=None):
+    cfg = dict(DEFAULT_CONFIG)
+    if config:
+        cfg.update(config)
+    return cfg
 
-    speed = 1 + (maxSpeed - 1) * (log(ships) / log(1000)) ** 1.5
 
-    Parameters
-    ----------
-    ships : int
-        Number of ships in the fleet.
-    max_speed : float
-        Maximum fleet speed (default 6.0).
-
-    Returns
-    -------
-    float
-        Fleet speed in units/turn.
-    """
+def compute_fleet_speed(ships, config=None):
+    cfg = get_config(config)
     if ships <= 0:
         return 1.0
-    return 1.0 + (max_speed - 1.0) * (math.log(ships) / math.log(1000)) ** 1.5
+    return 1.0 + (cfg["shipSpeed"] - 1.0) * (
+        math.log(ships) / _LOG1K
+    ) ** 1.5
 
 
-def predict_planet_pos(planet_id, initial_planets, angular_velocity, at_step):
-    """Predict the (x, y) position of a planet at a future step.
-
-    For orbiting planets (orbital_r + radius < 50), computes circular
-    motion from the initial position.  For static planets, returns
-    the fixed initial position.
-
-    Parameters
-    ----------
-    planet_id : int
-        Planet ID to predict.
-    initial_planets : list of [id, owner, x, y, radius, ships, production]
-        Planet snapshots from turn 0 (obs.initial_planets).
-    angular_velocity : float
-        Radians per turn (obs.angular_velocity).
-    at_step : float
-        Absolute step number to predict at.
-
-    Returns
-    -------
-    (float, float) or None
-        Predicted (x, y), or None if planet_id is not in initial_planets.
+def is_orbiting(planet):
+    """True if the planet rotates around the sun.
+    
+    Planets orbit when orbital radius + radius < 50.
+    Comets never orbit regardless of position.
     """
-    initial = None
-    for p in initial_planets:
-        if p[0] == planet_id:
-            initial = p
-            break
-    if initial is None:
-        return None
-
-    dx = initial[2] - CENTER
-    dy = initial[3] - CENTER
-    orbital_r = math.hypot(dx, dy)
-
-    if orbital_r + initial[4] >= ROTATION_RADIUS_LIMIT:
-        # Static planet — position never changes
-        return (initial[2], initial[3])
-
-    # Orbiting planet — circular motion around the sun
-    init_angle = math.atan2(dy, dx)
-    cur_angle = init_angle + angular_velocity * at_step
-
-    return (
-        CENTER + orbital_r * math.cos(cur_angle),
-        CENTER + orbital_r * math.sin(cur_angle),
-    )
+    if planet.get("comet", False):
+        return False
+    dx = planet["x"] - CENTER
+    dy = planet["y"] - CENTER
+    return math.hypot(dx, dy) + planet.get("radius", 0) < ROTATION_RADIUS_LIMIT
 
 
 def point_segment_dist(px, py, ax, ay, bx, by):
@@ -100,221 +59,199 @@ def point_segment_dist(px, py, ax, ay, bx, by):
     return math.hypot(px - proj_x, py - proj_y)
 
 
-def segment_hits_sun(ax, ay, bx, by):
-    """True if line segment AB passes within the sun radius of the centre."""
-    return point_segment_dist(CENTER, CENTER, ax, ay, bx, by) < SUN_RADIUS
+def segment_hits_sun(ax, ay, bx, by, config=None):
+    cfg = get_config(config)
+    center = cfg["boardSize"] / 2.0
+    return point_segment_dist(center, center, ax, ay, bx, by) < cfg["sunRadius"]
 
 
-def segment_goes_oob(ax, ay, bx, by):
-    """True if any part of line segment AB lies outside the [0,100] board.
+def predict_planet_pos(planet, turns_ahead, angular_velocity, config=None, comet_paths=None):
+    """Predict (x, y) of a planet `turns_ahead` from now.
 
-    Both endpoints are assumed to be inside the board (planets are always
-    in-bounds).  The function checks whether the line between them
-    intersects any of the four boundary edges.
+    Orbiting planets: circular motion around the sun from their
+    current position. Comets: looked up from observed path data.
+    Static planets: current position unchanged.
+    Returns None if a comet will have left the board by then.
     """
-    min_x = min(ax, bx)
-    max_x = max(ax, bx)
-    min_y = min(ay, by)
-    max_y = max(ay, by)
+    # Comet path lookup
+    if planet.get("comet", False) and comet_paths is not None:
+        pp = comet_paths.get(planet["id"])
+        if pp is not None:
+            path, idx = pp
+            j = idx + int(round(turns_ahead))
+            if 0 <= j < len(path):
+                return float(path[j][0]), float(path[j][1])
+            return None
 
-    # Fast path — bounding box fully inside
-    if (min_x >= 0 and max_x <= BOARD_SIZE
-            and min_y >= 0 and max_y <= BOARD_SIZE):
-        return False
+    # Static planet — position never changes
+    if not is_orbiting(planet):
+        return planet["x"], planet["y"]
 
-    # Check intersection with each edge: x=0, x=100, y=0, y=100
-    # Parametric form: (x,y) = (ax, ay) + t * (bx-ax, by-ay), t in [0,1]
-
-    if min_x < 0 and abs(bx - ax) > 1e-12:
-        t = -ax / (bx - ax)
-        if 0.0 < t < 1.0:
-            y_at = ay + t * (by - ay)
-            if 0.0 <= y_at <= BOARD_SIZE:
-                return True
-
-    if max_x > BOARD_SIZE and abs(bx - ax) > 1e-12:
-        t = (BOARD_SIZE - ax) / (bx - ax)
-        if 0.0 < t < 1.0:
-            y_at = ay + t * (by - ay)
-            if 0.0 <= y_at <= BOARD_SIZE:
-                return True
-
-    if min_y < 0 and abs(by - ay) > 1e-12:
-        t = -ay / (by - ay)
-        if 0.0 < t < 1.0:
-            x_at = ax + t * (bx - ax)
-            if 0.0 <= x_at <= BOARD_SIZE:
-                return True
-
-    if max_y > BOARD_SIZE and abs(by - ay) > 1e-12:
-        t = (BOARD_SIZE - ay) / (by - ay)
-        if 0.0 < t < 1.0:
-            x_at = ax + t * (bx - ax)
-            if 0.0 <= x_at <= BOARD_SIZE:
-                return True
-
-    return False
+    # Orbiting planet — circular motion from current angle
+    dx = planet["x"] - CENTER
+    dy = planet["y"] - CENTER
+    r = math.hypot(dx, dy)
+    a = math.atan2(dy, dx) + angular_velocity * turns_ahead
+    return CENTER + r * math.cos(a), CENTER + r * math.sin(a)
 
 
-def fleet_hits_obstacles(source, target_id, tx, ty, angle, speed, planets,
-                         initial_planets, angular_velocity, step):
-    """Check whether a fleet collides with any non-target planet en route.
+def _solve_intercept(source, target, ships, angular_velocity, config=None, comet_paths=None):
+    """Find aim point such that fleet and target arrive together.
 
-    Discretises the flight into per-tick steps.  At each tick the fleet
-    position is compared against every planet (orbiting positions are
-    predicted forward).
+    Scans flight time for the first feasible arrival, then bisects
+    for sub-turn precision on orbiting targets. Replaces the old
+    fixed-point iteration which failed when target tangential speed
+    rivaled fleet speed.
 
-    Parameters
-    ----------
-    source : Planet namedtuple
-        Launching planet.
-    target_id : int
-        Destination planet id (exempt from obstacle check).
-    tx, ty : float
-        Intercept point (final target position at arrival).
-    angle : float
-        Launch angle in radians.
-    speed : float
-        Fleet speed (units/tick).
-    planets : list of Planet namedtuple
-        All planets at current step.
-    initial_planets, angular_velocity, step : as in compute_attack_angle.
-
-    Returns
-    -------
-    bool
-        True if the fleet would hit an obstacle planet.
+    Returns (tx, ty, arrival_turns) or None if unreachable.
     """
-    start_x = source.x + math.cos(angle) * (source.radius + 0.1)
-    start_y = source.y + math.sin(angle) * (source.radius + 0.1)
+    cfg = get_config(config)
+    spd = compute_fleet_speed(ships, cfg)
+    sx, sy = source["x"], source["y"]
+    off = source.get("radius", 0) + 0.1
 
-    dist = math.hypot(tx - start_x, ty - start_y)
+    moving = target.get("comet", False) or is_orbiting(target)
+
+    # Static target — direct line, no intercept needed
+    if not moving:
+        d = math.hypot(target["x"] - sx, target["y"] - sy)
+        arrival = max(0.0, (d - off) / spd)
+        return target["x"], target["y"], arrival
+
+    # Fleet's straight-line reach after t turns (spawn offset + speed * time)
+    def reach(t):
+        return off + spd * t
+
+    for ti in range(1, 301):
+        p = predict_planet_pos(target, ti, angular_velocity, cfg, comet_paths)
+        if p is None:
+            return None  # comet left the board
+        if reach(ti) >= math.hypot(p[0] - sx, p[1] - sy):
+            if target.get("comet", False):
+                return p[0], p[1], float(ti)
+            # Bisect within the winning turn for sub-turn precision
+            lo, hi = float(ti - 1), float(ti)
+            for _ in range(20):
+                mid = (lo + hi) / 2.0
+                pm = predict_planet_pos(target, mid, angular_velocity, cfg, comet_paths)
+                if pm is None:
+                    return None
+                if reach(mid) >= math.hypot(pm[0] - sx, pm[1] - sy):
+                    hi = mid
+                else:
+                    lo = mid
+            ph = predict_planet_pos(target, hi, angular_velocity, cfg, comet_paths)
+            if ph is None:
+                return None
+            return ph[0], ph[1], hi
+    return None
+
+
+def fleet_hits_obstacles(source, target_id, tx, ty, angle, speed,
+                         planets, angular_velocity, config=None, comet_paths=None):
+    """True if the fleet collides with any non-target planet en route.
+
+    Static planets: exact segment-to-point distance check.
+    Moving planets/comets: sampled every 0.5 turns against predicted
+    positions along the flight path.
+    """
+    cfg = get_config(config)
+    sx = source["x"] + math.cos(angle) * (source.get("radius", 0) + 0.1)
+    sy = source["y"] + math.sin(angle) * (source.get("radius", 0) + 0.1)
+
+    dist = math.hypot(tx - sx, ty - sy)
     total_ticks = max(1, math.ceil(dist / speed))
+    margin = 0.5
 
-    for tick in range(1, total_ticks + 1):
-        fx = start_x + math.cos(angle) * speed * tick
-        fy = start_y + math.sin(angle) * speed * tick
+    static = []
+    moving = []
+    for p in planets:
+        pid = p["id"]
+        if pid == source["id"] or pid == target_id:
+            continue
+        if p.get("comet", False) or is_orbiting(p):
+            moving.append(p)
+        else:
+            static.append(p)
 
-        for p in planets:
-            pid = p.id
-            if pid == source.id or pid == target_id:
-                continue
+    for p in static:
+        if point_segment_dist(p["x"], p["y"], sx, sy, tx, ty) < p.get("radius", 0) + margin:
+            return True
 
-            # Predict planet position at this future step
-            pos = predict_planet_pos(pid, initial_planets, angular_velocity,
-                                     step + tick)
-            if pos is None:
-                px, py = p.x, p.y
-            else:
-                px, py = pos
-
-            if math.hypot(fx - px, fy - py) < p.radius:
-                return True
+    if moving:
+        step = 0.5
+        t = step
+        while t <= total_ticks + step:
+            fx = sx + math.cos(angle) * speed * t
+            fy = sy + math.sin(angle) * speed * t
+            for p in moving:
+                pos = predict_planet_pos(p, t, angular_velocity, cfg, comet_paths)
+                if pos is None:
+                    continue
+                if math.hypot(fx - pos[0], fy - pos[1]) < p.get("radius", 0) + margin:
+                    return True
+            t += step
 
     return False
 
 
 def compute_attack_angle(source, target, ships, planets,
-                         initial_planets, angular_velocity, step=0):
-    """Compute the launch angle to send ships from *source* to *target*.
+                         angular_velocity, step=0, config=None, comet_paths=None):
+    """Compute the launch angle to send ships from source to target.
 
     Accounts for:
-      * Orbiting target motion (iterative fixed-point intercept).
-      * Sun collision (segment passes within 10 units of centre).
-      * Out-of-bounds (segment exits the 100×100 board).
-      * Obstacle planets (any other planet intersects the path).
+      * Orbiting target motion (time-scan + bisect intercept).
+      * Comet paths (looked up from observed trajectory).
+      * Sun collision (fleet destroyed if path passes within sun radius).
+      * Obstacle planets (any other planet in the flight path).
 
     Parameters
     ----------
-    source : Planet
-        Source planet (namedtuple with .id, .x, .y, .radius, …).
-    target : Planet
-        Target planet.
+    source : dict
+        Source planet with keys id, x, y, radius.
+    target : dict
+        Target planet with keys id, x, y, radius, comet.
     ships : int
-        Number of ships to send (determines fleet speed).
-    planets : list of Planet
-        All planets at the current step.
-    initial_planets : list of list
-        Turn-0 planet snapshot (obs.initial_planets).
+        Number of ships to send.
+    planets : list of dict
+        All current planets.
     angular_velocity : float
-        Planet rotation speed in rad/turn (obs.angular_velocity).
+        Radians per turn from obs.
     step : int
-        Current game step (default 0).
+        Current game step (kept for backward compatibility).
+    config : dict or None
+        Override defaults: shipSpeed, sunRadius, boardSize, cometSpeed.
+    comet_paths : dict or None
+        {planet_id: (path_list, path_index)} from obs.
 
     Returns
     -------
     float
-        Launch angle in radians (0 = right, π/2 = down), or
+        Launch angle in radians (0 = right, pi/2 = down), or
         -1.0 if the target cannot be reached.
     """
     if ships <= 0:
         return -1.0
 
-    speed = compute_fleet_speed(ships)
-    src_id = source.id
-    tgt_id = target.id
+    cfg = get_config(config)
+    spd = compute_fleet_speed(ships, cfg)
 
-    # -- Determine whether the target orbits ---------------------------------
-    target_orbiting = False
-    target_orbital_r = 0.0
-    target_init_angle = 0.0
-    for p in initial_planets:
-        if p[0] == tgt_id:
-            dx = p[2] - CENTER
-            dy = p[3] - CENTER
-            orbital_r = math.hypot(dx, dy)
-            if orbital_r + p[4] < ROTATION_RADIUS_LIMIT:
-                target_orbiting = True
-                target_orbital_r = orbital_r
-                target_init_angle = math.atan2(dy, dx)
-            break
+    sol = _solve_intercept(source, target, ships, angular_velocity, cfg, comet_paths)
+    if sol is None:
+        return -1.0
+    tx, ty, arrival_t = sol
 
-    # -- Intercept angle -----------------------------------------------------
-    if target_orbiting:
-        # Fixed-point iteration: aim, estimate flight time, re-aim at future
-        # target position, repeat.
-        tx, ty = target.x, target.y
-        angle = math.atan2(ty - source.y, tx - source.x)
+    angle = math.atan2(ty - source["y"], tx - source["x"])
 
-        for _ in range(MAX_ITER):
-            dist = math.hypot(tx - source.x, ty - source.y)
-            flight_time = dist / speed
+    # Fleet spawns just outside the source planet surface
+    sx = source["x"] + math.cos(angle) * (source.get("radius", 0) + 0.1)
+    sy = source["y"] + math.sin(angle) * (source.get("radius", 0) + 0.1)
 
-            future_angle = (target_init_angle
-                            + angular_velocity * (step + flight_time))
-            pred_x = CENTER + target_orbital_r * math.cos(future_angle)
-            pred_y = CENTER + target_orbital_r * math.sin(future_angle)
-
-            new_angle = math.atan2(pred_y - source.y, pred_x - source.x)
-
-            if abs(new_angle - angle) < CONVERGENCE_THRESHOLD:
-                angle = new_angle
-                tx, ty = pred_x, pred_y
-                break
-
-            angle = new_angle
-            tx, ty = pred_x, pred_y
-    else:
-        angle = math.atan2(target.y - source.y, target.x - source.x)
-        tx, ty = target.x, target.y
-
-    # -- Fleet start position (just outside source planet) ------------------
-    start_x = source.x + math.cos(angle) * (source.radius + 0.1)
-    start_y = source.y + math.sin(angle) * (source.radius + 0.1)
-
-    # -- Feasibility checks --------------------------------------------------
-
-    # 1. Sun collision
-    if segment_hits_sun(start_x, start_y, tx, ty):
+    if segment_hits_sun(sx, sy, tx, ty, cfg):
         return -1.0
 
-    # 2. Out of bounds
-    if segment_goes_oob(start_x, start_y, tx, ty):
-        return -1.0
-
-    # 3. Obstacle planets
-    if fleet_hits_obstacles(source, tgt_id, tx, ty, angle, speed,
-                            planets, initial_planets, angular_velocity, step):
+    if fleet_hits_obstacles(source, target["id"], tx, ty, angle, spd,
+                            planets, angular_velocity, cfg, comet_paths):
         return -1.0
 
     return angle
