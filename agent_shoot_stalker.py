@@ -11,8 +11,8 @@ from utils import compute_attack_angle, is_orbiting
 def agent(obs):
     player, step, planets, w = parse(obs)
 
-    if step % 5 != 0:
-        return []
+    # if step % 5 != 0:
+    #     return []
 
     orbiting = [p for p in planets if is_orbiting(p) and p["owner"] != player]
     if not orbiting:
