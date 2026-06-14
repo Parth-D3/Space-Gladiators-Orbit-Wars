@@ -8,7 +8,7 @@ import random
 
 
 def agent(obs):
-    player, step, planets, w = parse(obs)
+    player, step, planets, w, comet_paths = parse(obs)
 
     if step % 5 != 0:
         return []
@@ -25,7 +25,7 @@ def agent(obs):
             continue
         max_send = min(20, avail - 1)
         n = random.randint(1, max_send)
-        angle = compute_attack_angle(src, target, n, planets, w)
+        angle = compute_attack_angle(src, target, n, planets, w, comet_paths=comet_paths)
         if angle >= 0:
             moves.append([src["id"], float(angle), n])
     return moves

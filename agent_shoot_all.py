@@ -20,6 +20,14 @@ def parse(obs):
                 "prod": float(p[6]), "comet": False,
             })
         w = float(obs.get("angular_velocity", 0.0) or 0.0)
+        comet_planet_ids = set(obs.get("comet_planet_ids", []))
+        comet_paths = {}
+        for group in obs.get("comets", []):
+            idx = group.get("path_index", 0)
+            for i, pid in enumerate(group.get("planet_ids", [])):
+                paths = group.get("paths", [])
+                if i < len(paths):
+                    comet_paths[int(pid)] = (paths[i], int(idx))
     else:
         player = obs.player
         step = obs.step
@@ -32,11 +40,22 @@ def parse(obs):
                 "prod": float(p[6]), "comet": False,
             })
         w = float(obs.angular_velocity or 0.0)
-    return player, step, planets, w
+        comet_planet_ids = set(getattr(obs, "comet_planet_ids", []))
+        comet_paths = {}
+        for group in getattr(obs, "comets", []) or []:
+            idx = getattr(group, "path_index", 0)
+            for i, pid in enumerate(getattr(group, "planet_ids", [])):
+                paths = getattr(group, "paths", [])
+                if i < len(paths):
+                    comet_paths[int(pid)] = (paths[i], int(idx))
+    for p in planets:
+        if p["id"] in comet_planet_ids:
+            p["comet"] = True
+    return player, step, planets, w, comet_paths
 
 
 def agent(obs):
-    player, step, planets, w = parse(obs)
+    player, step, planets, w, comet_paths = parse(obs)
 
     if step % 5 != 0:
         return []
@@ -45,7 +64,7 @@ def agent(obs):
     moves = []
 
     my_planets = [p for p in planets if p["owner"] == player and p["ships"] >= 1]
-    targets = [p for p in planets]
+    targets = [p for p in planets if not p.get("comet", False)]
 
     for src in my_planets:
         for tgt in targets:
@@ -53,7 +72,7 @@ def agent(obs):
                 continue
             angle = compute_attack_angle(
                 src, tgt, 1, planets, w,
-                config=config, comet_paths=None,
+                config=config, comet_paths=comet_paths,
             )
             if angle >= 0:
                 moves.append([src["id"], float(angle), 1])

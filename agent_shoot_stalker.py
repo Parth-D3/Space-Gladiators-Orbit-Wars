@@ -9,7 +9,7 @@ from utils import compute_attack_angle, is_orbiting
 
 
 def agent(obs):
-    player, step, planets, w = parse(obs)
+    player, step, planets, w, comet_paths = parse(obs)
 
     # if step % 5 != 0:
     #     return []
@@ -21,7 +21,7 @@ def agent(obs):
 
     moves = []
     for src in [p for p in planets if p["owner"] == player and p["ships"] >= 1]:
-        angle = compute_attack_angle(src, target, 1, planets, w)
+        angle = compute_attack_angle(src, target, 1, planets, w, comet_paths=comet_paths)
         if angle >= 0:
             moves.append([src["id"], float(angle), 1])
     return moves
