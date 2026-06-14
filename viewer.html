@@ -12,6 +12,7 @@
   #header a { color: #1ebeff; text-decoration: none; }
   #viewer { width: 100%; aspect-ratio: 1; background: #1c1d20; position: relative; display: flex; align-items: center; justify-content: center; border: 2px solid #333; border-radius: 4px; }
   #viewer canvas { display: block; max-width: 100%; max-height: 100%; }
+  #configDisplay { width: 100%; display: flex; justify-content: center; gap: 16px; padding: 2px 0; font-size: 12px; color: #999; min-height: 0; flex-wrap: wrap; }
   #legend { width: 100%; display: flex; justify-content: center; gap: 24px; padding: 6px 0; font-size: 14px; min-height: 36px; align-items: center; }
   #legend li { display: flex; align-items: center; gap: 6px; list-style: none; }
   #legend .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
@@ -44,7 +45,8 @@
   <div id="viewer">
     <div id="placeholder">Load a replay file to view</div>
   </div>
-  <div id="legend"></div>
+    <div id="configDisplay"></div>
+    <div id="legend"></div>
   <div id="loadArea">
     <button id="loadBtn">Load Replay</button>
     <span id="fileName"></span>
@@ -213,6 +215,7 @@
   const playIcon = document.getElementById("playIcon");
   const stepSlider = document.getElementById("stepSlider");
   const stepCount = document.getElementById("stepCount");
+  const configDisplay = document.getElementById("configDisplay");
   const legend = document.getElementById("legend");
   const fileInput = document.getElementById("fileInput");
   const loadBtn = document.getElementById("loadBtn");
@@ -277,13 +280,38 @@
 
   function togglePlay() { playing ? pause() : play(); }
 
+  // --- Config display ---
+  function showConfig(cfg) {
+    if (!cfg) { configDisplay.innerHTML = ""; return; }
+    const parts = [];
+    if (cfg.seed !== undefined) parts.push(`seed: ${cfg.seed}`);
+    if (cfg.agents) parts.push(`agents: ${cfg.agents.join(", ")}`);
+    if (cfg.shipSpeed !== undefined) parts.push(`shipSpeed: ${cfg.shipSpeed}`);
+    if (cfg.sunRadius !== undefined) parts.push(`sunRadius: ${cfg.sunRadius}`);
+    if (cfg.boardSize !== undefined) parts.push(`boardSize: ${cfg.boardSize}`);
+    if (cfg.cometSpeed !== undefined) parts.push(`cometSpeed: ${cfg.cometSpeed}`);
+    configDisplay.textContent = parts.join("  ·  ");
+  }
+
   // --- Load file ---
   function loadReplay(data) {
     pause();
-    steps = data;
+    let stepsData, configData;
+    if (Array.isArray(data)) {
+      stepsData = data;
+      configData = null;
+    } else if (data && Array.isArray(data.steps)) {
+      stepsData = data.steps;
+      configData = data.config || null;
+    } else {
+      alert("Invalid replay file: expected an array of steps or {config, steps} object.");
+      return;
+    }
+    steps = stepsData;
     step = 0;
     placeholder.classList.add("hidden");
     controls.classList.remove("hidden");
+    showConfig(configData);
     if (steps.length > 0) {
       // Build legend
       const first = steps[0];
@@ -307,12 +335,7 @@
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const data = JSON.parse(ev.target.result);
-        if (Array.isArray(data)) {
-          loadReplay(data);
-        } else {
-          alert("Invalid replay file: expected an array of steps.");
-        }
+        loadReplay(JSON.parse(ev.target.result));
       } catch (err) {
         alert("Error parsing JSON: " + err.message);
       }
