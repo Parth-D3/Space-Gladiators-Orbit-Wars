@@ -226,19 +226,19 @@ def compute_attack_angle(source, target, ships, planets,
 
     Returns
     -------
-    float
+    float or None
         Launch angle in radians (0 = right, pi/2 = down), or
-        -1.0 if the target cannot be reached.
+        None if the target cannot be reached.
     """
     if ships <= 0:
-        return -1.0
+        return None
 
     cfg = get_config(config)
     spd = compute_fleet_speed(ships, cfg)
 
     sol = _solve_intercept(source, target, ships, angular_velocity, cfg, comet_paths)
     if sol is None:
-        return -1.0
+        return None
     tx, ty, arrival_t = sol
 
     angle = math.atan2(ty - source["y"], tx - source["x"])
@@ -248,10 +248,10 @@ def compute_attack_angle(source, target, ships, planets,
     sy = source["y"] + math.sin(angle) * (source.get("radius", 0) + 0.1)
 
     if segment_hits_sun(sx, sy, tx, ty, cfg):
-        return -1.0
+        return None
 
     if fleet_hits_obstacles(source, target["id"], tx, ty, angle, spd,
                             planets, angular_velocity, cfg, comet_paths):
-        return -1.0
+        return None
 
     return angle
