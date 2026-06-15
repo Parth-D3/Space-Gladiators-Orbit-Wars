@@ -83,7 +83,7 @@ def agent(obs):
                 src, tgt, 1, planets, w,
                 config=config, comet_paths=comet_paths,
             )
-            if angle >= 0:
+            if angle is not None:
                 moves.append([src["id"], float(angle), 1])
 
     return moves

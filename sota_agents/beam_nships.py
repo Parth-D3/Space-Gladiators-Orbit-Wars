@@ -38,7 +38,7 @@ def agent(obs):
         if avail < required:
             continue
         angle = compute_attack_angle(src, target, required, planets, w, comet_paths=comet_paths)
-        if angle >= 0:
+        if angle is not None:
             moves.append([sid, float(angle), required])
             _next_fleet[sid] = required + 30
 

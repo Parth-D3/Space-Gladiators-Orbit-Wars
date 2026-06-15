@@ -30,6 +30,6 @@ def agent(obs):
     moves = []
     for src in [p for p in planets if p["owner"] == player and p["ships"] >= 15]:
         angle = compute_attack_angle(src, target, 15, planets, w, comet_paths=comet_paths)
-        if angle >= 0:
+        if angle is not None:
             moves.append([src["id"], float(angle), 15])
     return moves
