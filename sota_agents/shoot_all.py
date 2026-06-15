@@ -4,6 +4,15 @@ agent_shoot_all.py — fires 1 ship at every planet it can reach.
 Demonstrates compute_attack_angle by attempting a shot from every
 owned planet to every other planet with a 1-ship fleet.
 """
+import sys, os
+try:
+    _DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _DIR = os.getcwd()
+_PARENT = os.path.dirname(_DIR)
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
 from utils import compute_attack_angle, is_orbiting
 
 

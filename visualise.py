@@ -3,7 +3,7 @@ import json, sys
 
 from utils import DEFAULT_CONFIG
 
-agents = sys.argv[1:3] if len(sys.argv) >= 3 else ["main.py", "random"]
+agents = sys.argv[1:3] if len(sys.argv) >= 3 else ["sota_agents/ppo.py", "random"]
 seed = int(sys.argv[3]) if len(sys.argv) >= 4 else 42
 output = sys.argv[4] if len(sys.argv) >= 5 else "replay.json"
 
