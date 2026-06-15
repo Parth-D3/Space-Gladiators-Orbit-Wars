@@ -41,6 +41,12 @@ from kaggle_environments import make
 
 import ow_features as F
 
+try:
+    import wandb as _wandb
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
+
 
 # ------------------------------ policy net ----------------------------------
 
@@ -434,6 +440,14 @@ def parse_args():
                     help="train against greedy argmax of current policy (self-play)")
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="save a self-play snapshot every N updates (0 = disabled)")
+    ap.add_argument("--wandb", action="store_true",
+                    help="enable Weights & Biases logging")
+    ap.add_argument("--wandb-project", type=str, default="space-gladiators-orbit-wars",
+                    help="wandb project name")
+    ap.add_argument("--wandb-entity", type=str, default=None,
+                    help="wandb entity/username")
+    ap.add_argument("--wandb-tags", type=str, default=None,
+                    help="comma-separated tags for the wandb run")
     return ap.parse_args()
 
 
@@ -484,6 +498,40 @@ def main():
           f"| auto_defend={auto_defend} "
           f"({sum(p.numel() for p in model.parameters()):,} params)")
 
+    if args.wandb:
+        if not _HAS_WANDB:
+            print("wandb not installed; install with `pip install wandb`")
+        else:
+            tags = args.wandb_tags.split(",") if args.wandb_tags else None
+            _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                tags=tags,
+                config={
+                    "total_steps": args.total_steps,
+                    "rollout": args.rollout,
+                    "epochs": args.epochs,
+                    "minibatch": args.minibatch,
+                    "lr": args.lr,
+                    "gamma": args.gamma,
+                    "lam": args.lam,
+                    "clip": args.clip,
+                    "vcoef": args.vcoef,
+                    "ecoef": args.ecoef,
+                    "max_grad_norm": args.max_grad_norm,
+                    "players": args.players,
+                    "selfplay": args.selfplay,
+                    "opponent": opp_label,
+                    "auto_defend": auto_defend,
+                    "overflow_cap": args.overflow_cap,
+                    "seed": args.seed,
+                    "device": str(device),
+                    "params": sum(p.numel() for p in model.parameters()),
+                    "policy_arch": "v4",
+                },
+            )
+            _wandb.watch(model, log="gradients", log_freq=100)
+
     while steps < args.total_steps:
         B, v_last = runner.rollout(args.rollout)
         adv, ret = compute_gae(B["rew"], B["val"], B["done"], v_last, args.gamma, args.lam)
@@ -508,6 +556,29 @@ def main():
               f"| winrate(last{len(res)}) {winrate:5.0%} | ep_ret {mean_ret:+7.2f} "
               f"| pi {pl:+.3f} v {vl:.3f} ent {ent:.2f} | {sps:,.0f} steps/s")
 
+        if args.wandb and _wandb.run is not None:
+            wins = sum(1 for r in res if r == 1)
+            draws = sum(1 for r in res if r == 0)
+            losses = sum(1 for r in res if r == -1)
+            _wandb.log({
+                "update": update,
+                "steps": steps,
+                "episodes": runner.episodes,
+                "winrate": winrate,
+                "mean_ep_return": mean_ret,
+                "policy_loss": pl,
+                "value_loss": vl,
+                "entropy": ent,
+                "steps_per_sec": sps,
+                "wins": wins,
+                "draws": draws,
+                "losses": losses,
+                "n_episodes_in_window": len(res),
+            })
+
+    if args.wandb and _wandb.run is not None:
+        _wandb.log_artifact(args.ckpt, type="model", name="ppo_checkpoint")
+        _wandb.finish()
     print(f"done. saved {args.ckpt} and {args.out}")
 
 
