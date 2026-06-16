@@ -1,0 +1,12 @@
+__pycache__/
+.git/
+*.pt
+*.npz
+*.json
+wandb/
+docker/
+README.md
+TODO.md
+agents.md
+viewer.html
+sota_agents/
