@@ -406,39 +406,6 @@ def _eval_greedy(policy, opponent, n_games, players="mix",
           f"(winrate {w / max(n_games, 1):.0%}, mean ship diff {np.mean(diffs):+.1f})")
 
 
-# ------------------------------ arena (current vs past snapshot) --------------
-
-def _arena(model, snapshot_path, device, n_games, players="mix",
-           auto_defend=True, overflow_cap=300):
-    """Play current model (greedy) vs a past snapshot (greedy).
-    Returns (wins, draws, losses) from the current model's perspective.
-    Seats rotate so both sides play from each starting position."""
-    snap_model = TorchPolicy().to(device)
-    snap_model.load_state_dict(torch.load(snapshot_path, map_location=device))
-    snap_model.eval()
-    snap_agent = _greedy_opponent(snap_model, device, auto_defend, overflow_cap)
-
-    cur_agent = _greedy_opponent(model, device, auto_defend, overflow_cap)
-
-    w = d = l = 0
-    for i in range(n_games):
-        game = Game(snap_agent, seat=i, players=players)
-        obs = game.reset()
-        done = False
-        outcome = 0
-        while not done:
-            moves = cur_agent(obs)
-            obs, _r, done, outcome = game.step(moves)
-        w += outcome == 1
-        d += outcome == 0
-        l += outcome == -1
-        print(f"arena game {i + 1}/{n_games} ({game.num_players}p): "
-              f"{'WIN' if outcome == 1 else 'LOSS' if outcome == -1 else 'DRAW'}")
-    print(f"arena vs past snapshot: {w} wins / {d} draws / {l} losses "
-          f"(winrate {w / max(w + d + l, 1):.0%})")
-    return w, d, l
-
-
 # ------------------------------ main -----------------------------------------
 
 def parse_args():
@@ -473,10 +440,6 @@ def parse_args():
                     help="train against greedy argmax of current policy (self-play)")
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="save a self-play snapshot every N updates (0 = disabled)")
-    ap.add_argument("--arena-every", type=int, default=0,
-                    help="evaluate current vs past snapshot every N updates (0 = disabled)")
-    ap.add_argument("--arena-games", type=int, default=20,
-                    help="number of games per arena evaluation")
     ap.add_argument("--wandb", action="store_true",
                     help="enable Weights & Biases logging")
     ap.add_argument("--wandb-project", type=str, default="space-gladiators-orbit-wars",
@@ -569,17 +532,6 @@ def main():
             )
             _wandb.watch(model, log="gradients", log_freq=100)
 
-    # arena reference: a fixed snapshot we compare against every arena_every updates
-    arena_ref_path = None
-    if args.arena_every:
-        arena_ref_path = "arena_ref.pt"
-        if args.resume and os.path.exists(args.resume):
-            import shutil
-            shutil.copy2(args.resume, arena_ref_path)
-        else:
-            torch.save(model.state_dict(), arena_ref_path)
-        print(f"arena ref initialised from {args.resume or 'initial weights'} -> {arena_ref_path}")
-
     while steps < args.total_steps:
         B, v_last = runner.rollout(args.rollout)
         adv, ret = compute_gae(B["rew"], B["val"], B["done"], v_last, args.gamma, args.lam)
@@ -595,15 +547,6 @@ def main():
         if args.selfplay and args.snapshot_every and update % args.snapshot_every == 0:
             snap_path = f"selfplay_upd{update}.pt"
             torch.save(model.state_dict(), snap_path)
-
-        # arena: current policy vs the snapshot from arena_every updates ago
-        aw = ad = al = arena_winrate = 0
-        if args.arena_every and update % args.arena_every == 0 and arena_ref_path is not None:
-            aw, ad, al = _arena(model, arena_ref_path, device, args.arena_games,
-                                players=players, auto_defend=auto_defend,
-                                overflow_cap=args.overflow_cap)
-            arena_winrate = aw / max(aw + ad + al, 1)
-            torch.save(model.state_dict(), arena_ref_path)
 
         res = list(runner.results)
         winrate = (sum(1 for r in res if r == 1) / len(res)) if res else float("nan")
@@ -631,11 +574,6 @@ def main():
                 "draws": draws,
                 "losses": losses,
                 "n_episodes_in_window": len(res),
-                "arena_winrate": arena_winrate,
-                "arena_wins": aw,
-                "arena_draws": ad,
-                "arena_losses": al,
-                "arena_games": aw + ad + al,
             })
 
     if args.wandb and _wandb.run is not None:
