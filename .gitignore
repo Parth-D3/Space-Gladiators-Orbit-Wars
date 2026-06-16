@@ -3,3 +3,4 @@ __pycache__/
 *.pt
 *.npz
 wandb/
+docker/__pycache__/
