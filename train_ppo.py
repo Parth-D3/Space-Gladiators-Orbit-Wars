@@ -31,6 +31,7 @@ import argparse
 import collections
 import os
 import random
+import sys
 import time
 
 import numpy as np
@@ -163,6 +164,27 @@ def _greedy_opponent(model, device, auto_defend=True, overflow_cap=300):
     return agent
 
 
+# --------------------------- strong-agent opponent ---------------------------
+
+def _make_strong_opponent():
+    """Return an agent(obs) callable using a fresh ProducerLiteRuntime.
+    Each call creates a clean runtime so state does not leak between episodes."""
+    from sota_agents.strong_agent.main import ProducerLiteRuntime
+    from sota_agents.strong_agent.orbit_lite.adapter import (
+        single_obs_to_tensor,
+        sparse_action_row_to_moves,
+    )
+    runtime = ProducerLiteRuntime()
+    def agent(obs):
+        player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
+        player_id = int(player)
+        obs_tensors = single_obs_to_tensor(obs, player_id=player_id)
+        with torch.no_grad():
+            sparse_row = runtime.tensor_action(obs_tensors)
+        return sparse_action_row_to_moves(sparse_row, obs, player_id=player_id)
+    return agent
+
+
 # ------------------------------ environment ---------------------------------
 
 class Game:
@@ -237,6 +259,35 @@ class SelfPlayGame(Game):
         seat = self.seat if self.seat is not None else random.randrange(n)
         seat = seat % n
         agents = [self._opp_fn] * n
+        agents[seat] = None
+        self.env = make("orbit_wars", debug=False)
+        self.trainer = self.env.train(agents)
+        obs = self.trainer.reset()
+        m, o = F.totals(obs)
+        self.prev_diff = m - o
+        self.last_obs = obs
+        return obs
+
+
+class StrongAgentGame(Game):
+    """Train against the torch-based strong agent (sota_agents/strong_agent).
+    A fresh runtime is created per episode so that movement/launch memory
+    does not leak between games."""
+
+    def __init__(self, seat=None, players="mix"):
+        self.seat = seat
+        self.players = players
+
+    def reset(self):
+        if self.players in (2, 4):
+            n = self.players
+        else:
+            n = random.choice([2, 4])
+        self.num_players = n
+        seat = self.seat if self.seat is not None else random.randrange(n)
+        seat = seat % n
+        opp_fn = _make_strong_opponent()
+        agents = [opp_fn] * n
         agents[seat] = None
         self.env = make("orbit_wars", debug=False)
         self.trainer = self.env.train(agents)
@@ -438,6 +489,8 @@ def parse_args():
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--selfplay", action="store_true",
                     help="train against greedy argmax of current policy (self-play)")
+    ap.add_argument("--strong-agent", action="store_true",
+                    help="train against the torch-based strong agent (sota_agents/strong_agent)")
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="save a self-play snapshot every N updates (0 = disabled)")
     ap.add_argument("--wandb", action="store_true",
@@ -458,9 +511,11 @@ def main():
     players = int(args.players) if args.players in ("2", "4") else "mix"
     auto_defend = not args.no_auto_defend
 
+    if args.selfplay and args.strong_agent:
+        print("error: --selfplay and --strong-agent are mutually exclusive"); sys.exit(1)
+
     if args.eval:
         if args.selfplay:
-            # eval a self-play snapshot (--resume points to snapshot .pt)
             ckpt_path = args.resume if args.resume and os.path.exists(args.resume) else args.ckpt
             device = torch.device(args.device)
             model = TorchPolicy().to(device)
@@ -470,6 +525,10 @@ def main():
                                     for k, v in model.state_dict().items()})
             _eval_greedy(policy, args.opponent, args.eval, players=players,
                          auto_defend=auto_defend, overflow_cap=args.overflow_cap)
+        elif args.strong_agent:
+            evaluate(args.out, "sota_agents/strong_agent/main.py", args.eval,
+                     players=players, auto_defend=auto_defend,
+                     overflow_cap=args.overflow_cap)
         else:
             evaluate(args.out, args.opponent, args.eval, players=players,
                      auto_defend=auto_defend, overflow_cap=args.overflow_cap)
@@ -486,6 +545,9 @@ def main():
         game = SelfPlayGame(model, device, players=players,
                             auto_defend=auto_defend, overflow_cap=args.overflow_cap)
         opp_label = "self (greedy)"
+    elif args.strong_agent:
+        game = StrongAgentGame(players=players)
+        opp_label = "strong_agent"
     else:
         game = Game(args.opponent, players=players)
         opp_label = args.opponent
@@ -521,6 +583,7 @@ def main():
                     "max_grad_norm": args.max_grad_norm,
                     "players": args.players,
                     "selfplay": args.selfplay,
+                    "strong_agent": args.strong_agent,
                     "opponent": opp_label,
                     "auto_defend": auto_defend,
                     "overflow_cap": args.overflow_cap,
