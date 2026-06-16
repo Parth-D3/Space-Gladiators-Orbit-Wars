@@ -31,9 +31,11 @@ services:
     volumes:
       - ..:/workspace
     command:
-      - --total-steps=3000000
+      - --total-steps=5000000
       - --players=mix
       - --selfplay
+      - --snapshot-every=500
+      - --eval-past=20
       - --wandb
     deploy:
       resources:
