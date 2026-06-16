@@ -15,7 +15,12 @@ Action model (one decision per turn):
   x garrison fraction   {no-op, 25%, 50%, 75%, 100%}
 
 Reward (computed from observations, see ow_features.totals):
-    per step:  delta(my_total_ships - opp_total_ships) / 200
+    base:   delta(my_total_ships - opp_total_ships) / 200     per step
+    bonus:  +0.25 + 0.05*prod    per planet captured          one-shot
+            -0.25 - 0.05*prod - garrison/100   per planet lost (non-comet)  one-shot
+            -ships / 50   per comet garrison lost to expiry   one-shot
+            -ships * max(0, 1 - turns/5) / 200  per launch at expiring comet  one-shot
+            +0.001 * delta(prod_advantage)       per step
     terminal:  +3 win / -3 loss / 0 draw   (README scoring: highest total
                ships on planets + fleets wins; elimination also ends games)
 
@@ -222,11 +227,46 @@ class Game:
 
     def step(self, moves):
         obs, _env_reward, done, _info = self.trainer.step(moves)
-        self.last_obs = obs
+        extra = 0.0
+
+        # Detect events between steps for reward shaping
+        if self.last_obs is not None:
+            pv, pr, _, _, _, _ = F.parse(self.last_obs)
+            cv, cr, _, _, _, _ = F.parse(obs)
+
+            # 1. Comet garrison loss penalty (scaled by ships lost)
+            prev_cids = {r["id"] for r in pr if r["comet"]}
+            curr_cids = {r["id"] for r in cr if r["comet"]}
+            ships_lost = sum(r["ships"] for r in pr
+                             if r["id"] in (prev_cids - curr_cids)
+                             and r["owner"] == pv)
+            if ships_lost > 0:
+                extra -= ships_lost / 50.0
+
+            # 2. Planet capture bonus
+            prev_own = {r["id"] for r in pr if r["owner"] == pv}
+            curr_own = {r["id"] for r in cr if r["owner"] == cv}
+            for r in cr:
+                if r["id"] in (curr_own - prev_own):
+                    extra += 0.25 + 0.05 * r["prod"]
+
+            # 3. Planet loss penalty (non-comet — comets handled above)
+            for r in pr:
+                if r["id"] in (prev_own - curr_own) and not r["comet"]:
+                    extra -= 0.25 + 0.05 * r["prod"] + r["ships"] / 100.0
+
+            # 4. Production appreciation (leading indicator)
+            pmp = sum(r["prod"] for r in pr if r["owner"] == pv)
+            pop = sum(r["prod"] for r in pr if r["owner"] not in (-1, pv))
+            cmp_ = sum(r["prod"] for r in cr if r["owner"] == cv)
+            cop = sum(r["prod"] for r in cr if r["owner"] not in (-1, cv))
+            extra += 0.001 * ((cmp_ - cop) - (pmp - pop))
+
         m, o = F.totals(obs)
         diff = m - o
-        reward = (diff - self.prev_diff) / 200.0
+        reward = (diff - self.prev_diff) / 200.0 + extra
         self.prev_diff = diff
+        self.last_obs = obs
         outcome = 0
         if done:
             outcome = 1 if m > o else (-1 if m < o else 0)
@@ -332,6 +372,24 @@ class Runner:
             if self.overflow_cap:
                 moves = moves + F.overflow_attack(aux, cap=self.overflow_cap)
             obs, rew, done, outcome = self.game.step(moves)
+
+            # 5. Comet overcommit penalty — sending ships to a comet about to expire
+            rows = aux.get("rows", [])
+            if moves and int(a_t) < len(rows):
+                tgt = rows[int(a_t)]
+                if tgt.get("comet", False):
+                    pp = aux.get("comet_paths", {}).get(tgt["id"])
+                    if pp is not None:
+                        path, idx = pp
+                        turns_left = len(path) - 1 - idx
+                        if turns_left < 5:
+                            src = rows[int(a_s)]
+                            avail = int(src["ships"])
+                            frac = F.FRACS[int(a_f)]
+                            n = max(1, avail - 1) if frac >= 0.999 else max(1, int(frac * avail))
+                            n = min(n, avail)
+                            rew -= n * max(0.0, 1.0 - turns_left / 5.0) / 200.0
+
             self.ep_ret += rew
 
             B["P"].append(P); B["G"].append(G); B["sm"].append(sm); B["tm"].append(tm)
