@@ -1,67 +1,65 @@
 """
-Orbit Wars - Nearest Planet Sniper Agent
+main.py — Orbit Wars submission entry point (PPO policy, greedy inference).
 
-A simple agent that captures the nearest unowned planet when it has
-enough ships to guarantee the takeover.
+Runs the policy trained by train_ppo.py using pure numpy (no torch needed at
+inference). If ppo_weights.npz is missing or anything fails, it falls back to
+the repo's nearest-planet-sniper heuristic so the agent never errors out.
 
-Strategy:
-  For each planet we own, find the closest planet we don't own.
-  If we have more ships than the target's garrison, send exactly
-  enough to capture it (garrison + 1). Otherwise, wait and accumulate.
+Local test (per agents.md):
+    from kaggle_environments import make
+    env = make("orbit_wars", debug=True)
+    env.run(["main.py", "sniper.py"])
 
-Key concepts demonstrated:
-  - Parsing the observation (planets, player ID)
-  - Computing angles with atan2 for fleet direction
-  - Sending moves as [from_planet_id, angle, num_ships]
+Submit (multi-file bundle, per agents.md):
+    tar -czf submission.tar.gz main.py ow_features.py ppo_weights.npz
+    kaggle competitions submit orbit-wars -f submission.tar.gz -m "PPO v1"
 """
 
-import math
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
+import os
+import sys
 
-from utils import compute_attack_angle
+# Kaggle loads agents by exec'ing the file, where __file__ may be undefined.
+try:
+    _DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _DIR = os.getcwd()
+if _DIR not in sys.path:
+    sys.path.insert(0, _DIR)
+
+import numpy as np
+import ow_features as F
+
+def _find_weights():
+    for d in (_DIR, os.getcwd(), os.path.dirname(_DIR)):
+        p = os.path.join(d, "ppo_weights.npz")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+_policy = None
+_load_attempted = False
+
+
+def _load_policy():
+    global _policy, _load_attempted
+    if _load_attempted:
+        return
+    _load_attempted = True
+    try:
+        p = _find_weights()
+        if p is not None:
+            _policy = F.NumpyPolicy(np.load(p))
+    except Exception:
+        _policy = None
 
 
 def agent(obs):
-    moves = []
-    player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
-    raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets
-
-    # Parse into named tuples for readable field access:
-    #   Planet(id, owner, x, y, radius, ships, production)
-    #   owner == -1 means neutral, 0-3 are player IDs
-    planets = [Planet(*p) for p in raw_planets]
-    my_planets = [p for p in planets if p.owner == player]
-    targets = [p for p in planets if p.owner != player]
-
-    if not targets:
-        return moves
-
-    for mine in my_planets:
-        # Find the nearest planet we don't own
-        nearest = None
-        min_dist = float("inf")
-        for t in targets:
-            dist = math.sqrt((mine.x - t.x) ** 2 + (mine.y - t.y) ** 2)
-            if dist < min_dist:
-                min_dist = dist
-                nearest = t
-
-        if nearest is None:
-            continue
-
-        # We need to send more ships than the target has to capture it.
-        # Exactly target_ships + 1 guarantees the takeover.
-        ships_needed = nearest.ships + 1
-
-        # Only launch if we can afford it — otherwise keep accumulating
-        if mine.ships >= ships_needed:
-            angle = compute_attack_angle(
-                mine, nearest, ships_needed, planets,
-                obs.get("initial_planets", []),
-                obs.get("angular_velocity", 0),
-                obs.get("step", 0),
-            )
-            if angle != -1.0:
-                moves.append([mine.id, angle, ships_needed])
-
-    return moves
+    _load_policy()
+    if _policy is None:
+        return F.heuristic(obs)
+    try:
+        # greedy_moves = policy + action repair + auto-defend + overflow valve
+        return F.greedy_moves(_policy, obs, repair=True, defend=True, overflow_cap=300)
+    except Exception:
+        return F.heuristic(obs)
