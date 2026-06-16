@@ -490,6 +490,34 @@ def evaluate(weights_path, opponent, n_games, players="mix", auto_defend=True, o
           f"(winrate {w / max(n_games, 1):.0%}, mean ship diff {np.mean(diffs):+.1f})")
 
 
+def _eval_past_self(model, past_path, n_games, device, players="mix",
+                    auto_defend=True, overflow_cap=300):
+    """Evaluate current greedy model against a frozen past snapshot.
+    Returns (wins, draws, losses, mean_ep_return)."""
+    past_model = TorchPolicy().to(device)
+    past_model.load_state_dict(torch.load(past_path, map_location=device))
+    past_model.eval()
+
+    past_agent = _greedy_opponent(past_model, device, auto_defend, overflow_cap)
+    current_agent = _greedy_opponent(model, device, auto_defend, overflow_cap)
+
+    w = d = l = 0
+    rets = []
+    for g in range(n_games):
+        game = Game(past_agent, seat=g, players=players)
+        obs = game.reset()
+        ep_ret = 0.0
+        outcome = 0
+        done = False
+        while not done:
+            moves = current_agent(obs)
+            obs, rew, done, outcome = game.step(moves)
+            ep_ret += rew
+        rets.append(ep_ret)
+        w += outcome == 1; d += outcome == 0; l += outcome == -1
+    return w, d, l, np.mean(rets) if rets else 0.0
+
+
 def _eval_greedy(policy, opponent, n_games, players="mix",
                  auto_defend=True, overflow_cap=300):
     """Evaluate a NumpyPolicy against a fixed opponent (same as evaluate() but
@@ -551,6 +579,8 @@ def parse_args():
                     help="train against the torch-based strong agent (sota_agents/strong_agent)")
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="save a self-play snapshot every N updates (0 = disabled)")
+    ap.add_argument("--eval-past", type=int, default=0,
+                    help="evaluate current greedy policy vs previous self-play snapshot (N eval games)")
     ap.add_argument("--wandb", action="store_true",
                     help="enable Weights & Biases logging")
     ap.add_argument("--wandb-project", type=str, default="space-gladiators-orbit-wars",
@@ -571,6 +601,10 @@ def main():
 
     if args.selfplay and args.strong_agent:
         print("error: --selfplay and --strong-agent are mutually exclusive"); sys.exit(1)
+    if args.eval_past and not args.selfplay:
+        print("error: --eval-past requires --selfplay"); sys.exit(1)
+    if args.eval_past and not args.snapshot_every:
+        print("error: --eval-past requires --snapshot-every"); sys.exit(1)
 
     if args.eval:
         if args.selfplay:
@@ -612,6 +646,11 @@ def main():
 
     runner = Runner(game, model, device,
                     auto_defend=auto_defend, overflow_cap=args.overflow_cap)
+
+    # save initial snapshot so --eval-past has a baseline to compare against
+    if args.eval_past:
+        torch.save(model.state_dict(), "selfplay_upd0.pt")
+
     steps, update = 0, 0
     t0 = time.time()
     print(f"training on {device} vs '{opp_label}' | players={args.players} "
@@ -668,6 +707,26 @@ def main():
         if args.selfplay and args.snapshot_every and update % args.snapshot_every == 0:
             snap_path = f"selfplay_upd{update}.pt"
             torch.save(model.state_dict(), snap_path)
+
+            # evaluate vs previous snapshot (if past model snapshot exists)
+            if args.eval_past:
+                past_update = update - args.snapshot_every
+                past_path = f"selfplay_upd{past_update}.pt"
+                if os.path.exists(past_path):
+                    pw, pd, pl, pr = _eval_past_self(
+                        model, past_path, args.eval_past, device,
+                        players=players, auto_defend=auto_defend,
+                        overflow_cap=args.overflow_cap)
+                    print(f"  vs past self (upd {past_update}): "
+                          f"{pw}w/{pd}d/{pl}l  wr {pw/max(args.eval_past,1):.0%}  "
+                          f"mean_ep_ret {pr:+.2f}")
+                    if args.wandb and _wandb.run is not None:
+                        _wandb.log({
+                            "update": update,
+                            "eval_past_winrate": pw / max(args.eval_past, 1),
+                            "eval_past_mean_ep_return": pr,
+                            "eval_past_games": args.eval_past,
+                        })
 
         res = list(runner.results)
         winrate = (sum(1 for r in res if r == 1) / len(res)) if res else float("nan")
