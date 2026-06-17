@@ -33,6 +33,12 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+try:
+    import wandb as _wandb
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
+
 from kaggle_environments import make
 
 import ow_features as F
@@ -524,6 +530,12 @@ def parse_args():
     ap.add_argument("--eval", type=int, default=0, help="evaluate N games and exit")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
+    ap.add_argument("--wandb-project", type=str, default="space-gladiators-orbit-wars",
+                    help="wandb project name")
+    ap.add_argument("--wandb-entity", type=str, default=None, help="wandb entity/username")
+    ap.add_argument("--wandb-tags", type=str, default=None,
+                    help="comma-separated tags for the wandb run")
     return ap.parse_args()
 
 
@@ -568,6 +580,38 @@ def main():
           f"| auto_defend={auto_defend} "
           f"({sum(p.numel() for p in model.parameters()):,} params)")
 
+    if args.wandb:
+        if not _HAS_WANDB:
+            print("wandb not installed; install with `pip install wandb`")
+        else:
+            tags = args.wandb_tags.split(",") if args.wandb_tags else None
+            _wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                tags=tags,
+                config={
+                    "total_steps": args.total_steps,
+                    "rollout": args.rollout,
+                    "epochs": args.epochs,
+                    "minibatch": args.minibatch,
+                    "lr": args.lr,
+                    "gamma": args.gamma,
+                    "lam": args.lam,
+                    "clip": args.clip,
+                    "vcoef": args.vcoef,
+                    "ecoef": args.ecoef,
+                    "max_grad_norm": args.max_grad_norm,
+                    "players": args.players,
+                    "opponent": opp_label,
+                    "auto_defend": auto_defend,
+                    "overflow_cap": args.overflow_cap,
+                    "seed": args.seed,
+                    "device": str(device),
+                    "params": sum(p.numel() for p in model.parameters()),
+                },
+            )
+            _wandb.watch(model, log="gradients", log_freq=100)
+
     pbar = tqdm(total=args.total_steps, desc="Training", unit="step")
     while steps < args.total_steps:
         B, v_last = runner.rollout(args.rollout)
@@ -587,6 +631,28 @@ def main():
         lost = np.mean(runner.planets_lost) if runner.planets_lost else float("nan")
         blk = np.mean(runner.blocked_launches) if runner.blocked_launches else float("nan")
         sps = steps / (time.time() - t0)
+        if args.wandb and _wandb.run is not None:
+            wins = sum(1 for r in res if r == 1)
+            draws = sum(1 for r in res if r == 0)
+            losses = sum(1 for r in res if r == -1)
+            _wandb.log({
+                "update": update,
+                "steps": steps,
+                "episodes": runner.episodes,
+                "winrate": winrate,
+                "mean_ep_return": mean_ret,
+                "planets_captured": cap,
+                "planets_lost": lost,
+                "lane_blocked_rate": blk,
+                "policy_loss": pl,
+                "value_loss": vl,
+                "entropy": ent,
+                "steps_per_sec": sps,
+                "wins": wins,
+                "draws": draws,
+                "losses": losses,
+                "n_episodes_in_window": len(res),
+            })
         pbar.set_postfix(upd=update, win=f"{winrate:.0%}" if not math.isnan(winrate) else "N/A",
                          ret=f"{mean_ret:+.2f}" if not math.isnan(mean_ret) else "N/A",
                          pi=f"{pl:+.3f}", vl=f"{vl:.3f}", ent=f"{ent:.2f}",
@@ -598,6 +664,9 @@ def main():
               f"| pi {pl:+.3f} v {vl:.3f} ent {ent:.2f} | {sps:,.0f} s/s")
 
     pbar.close()
+    if args.wandb and _wandb.run is not None:
+        _wandb.log_artifact(args.ckpt, type="model", name="ppo_checkpoint")
+        _wandb.finish()
     print(f"done. saved {args.ckpt} and {args.out}")
 
 

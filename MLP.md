@@ -113,6 +113,17 @@ The network outputs logical intents. The environment requires physical commands 
 | `lost` | Planets lost/ep | Rolling mean of non-comet planets lost per game |
 | `lane` | Lane-blocked rate | Fraction of policy-chosen source/target pairs that failed sun, obstacle, or intercept checks — high values indicate the policy is attempting invalid launches |
 
+### Weights & Biases Logging
+
+| Flag | Description |
+|---|---|
+| `--wandb` | Enable wandb logging |
+| `--wandb-project` | Project name (default: `space-gladiators-orbit-wars`) |
+| `--wandb-entity` | Wandb entity/username |
+| `--wandb-tags` | Comma-separated tags for the run |
+
+Metrics logged per update: `winrate`, `mean_ep_return`, `planets_captured`, `planets_lost`, `lane_blocked_rate`, `policy_loss`, `value_loss`, `entropy`, `steps_per_sec`, `wins`, `draws`, `losses`. Hyperparameters (learning rate, rollout length, etc.) are saved as run config. Gradients are tracked via `wandb.watch`. The model checkpoint is logged as an artifact at the end of training.
+
 ### Opponent Strategy
 
 | `--opponent` | Description |
