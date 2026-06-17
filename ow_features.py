@@ -22,13 +22,12 @@ does NOT need torch at inference time.
 import math
 import numpy as np
 
+from utils import compute_attack_angle
+
 # ----- constants from README.md (Board Layout / Configuration defaults) -----
 BOARD = 100.0
 CX, CY = 50.0, 50.0        # sun center
-SUN_R = 10.0               # sunRadius default
-MAX_SPEED = 6.0            # shipSpeed default
 ROT_LIMIT = 50.0           # planets with orbital_radius + radius < 50 rotate
-SUN_MARGIN = 1.0           # extra clearance when checking sun-blocked launches
 
 # ----- encoding sizes (fixed-size tensors for the neural net) -----
 MAX_PLANETS = 64           # README: 20-40 planets + comets (groups of 4)
@@ -52,9 +51,8 @@ def get(obs, key, default=None):
 
 
 def fleet_speed(n):
-    """README 'Fleet Speed': speed = 1 + (maxSpeed-1)*(log(ships)/log(1000))^1.5."""
     n = max(1.0, float(n))
-    return min(MAX_SPEED, 1.0 + (MAX_SPEED - 1.0) * (math.log(n) / _LOG1K) ** 1.5)
+    return 1.0 + (6.0 - 1.0) * (math.log(n) / _LOG1K) ** 1.5
 
 
 def is_orbiting(x, y, radius, is_comet):
@@ -62,30 +60,6 @@ def is_orbiting(x, y, radius, is_comet):
     if is_comet:
         return False
     return math.hypot(x - CX, y - CY) + radius < ROT_LIMIT
-
-
-def predict_pos(x, y, radius, is_comet, w, t):
-    """Position t turns ahead.
-
-    Orbiting planets rotate around the sun at constant angular velocity w
-    (README). Comets follow elliptical paths that we do not re-simulate here,
-    so comets and static planets are predicted at their current position.
-    """
-    if t <= 0.0 or not is_orbiting(x, y, radius, is_comet):
-        return x, y
-    r = math.hypot(x - CX, y - CY)
-    a = math.atan2(y - CY, x - CX) + w * t
-    return CX + r * math.cos(a), CY + r * math.sin(a)
-
-
-def seg_point_dist(ax, ay, bx, by, px, py):
-    """Distance from point (px,py) to segment (ax,ay)-(bx,by)."""
-    vx, vy = bx - ax, by - ay
-    l2 = vx * vx + vy * vy
-    if l2 <= 1e-12:
-        return math.hypot(px - ax, py - ay)
-    s = max(0.0, min(1.0, ((px - ax) * vx + (py - ay) * vy) / l2))
-    return math.hypot(px - (ax + s * vx), py - (ay + s * vy))
 
 
 def parse(obs):
@@ -266,142 +240,13 @@ def totals(obs):
     return mine, (max(others.values()) if others else 0.0)
 
 
-def target_pos_at(row, t, w, comet_paths):
-    """Target position t turns ahead.
 
-    Orbiting planets: rotated by w*t around the sun (matches the env's
-    `initial_angle + angular_velocity * step`). Comets: looked up from their
-    observed path (`paths[i][path_index + t]`); returns None if the comet
-    will have left the board by then. Static planets: current position.
-    """
-    if row["comet"]:
-        pp = comet_paths.get(row["id"])
-        if pp is None:
-            return row["x"], row["y"]
-        path, idx = pp
-        j = idx + int(round(t))
-        if j >= len(path):
-            return None  # comet expires before the fleet could arrive
-        return float(path[j][0]), float(path[j][1])
-    return predict_pos(row["x"], row["y"], row["radius"], False, w, t)
-
-
-def _solve_intercept(s, t_row, n, w, comet_paths, max_turns=300):
-    """Find an aim point such that the fleet and target arrive together.
-
-    The old fixed-point iteration failed whenever the target's tangential
-    speed (up to ~2.4 u/turn near the rotation limit) rivaled the fleet's
-    speed — measured ~70% misses for 10-ship fleets. Instead, scan flight
-    time t for the first crossing where the fleet's reach >= distance to
-    target_pos(t), then bisect within that turn for sub-turn precision.
-
-    Two env facts matter (verified in the orbit_wars source):
-      * fleets spawn at planet_center + (radius + 0.1) * direction, so the
-        fleet's reach after t turns is (src_radius + 0.1) + speed * t;
-      * planet positions follow initial_angle + angular_velocity * step.
-
-    Returns (tx, ty, moving, arrival_turns) or None if no intercept exists.
-    """
-    sx, sy = s["x"], s["y"]
-    moving = t_row["comet"] or is_orbiting(t_row["x"], t_row["y"], t_row["radius"], False)
-    spd = fleet_speed(n)
-    off = s["radius"] + 0.1  # spawn offset: fleet starts outside the source planet
-    if not moving:
-        d = math.hypot(t_row["x"] - s["x"], t_row["y"] - s["y"])
-        return t_row["x"], t_row["y"], False, max(0.0, (d - off) / spd)
-
-    def reach(t):
-        return off + spd * t
-
-    for ti in range(1, max_turns + 1):
-        p = target_pos_at(t_row, ti, w, comet_paths)
-        if p is None:
-            return None  # comet gone before any feasible intercept
-        if reach(ti) >= math.hypot(p[0] - sx, p[1] - sy):
-            if t_row["comet"]:
-                return p[0], p[1], True, float(ti)  # comet path is per-turn discrete
-            lo, hi = float(ti - 1), float(ti)
-            for _ in range(20):
-                mid = 0.5 * (lo + hi)
-                pm = predict_pos(t_row["x"], t_row["y"], t_row["radius"], False, w, mid)
-                if reach(mid) >= math.hypot(pm[0] - sx, pm[1] - sy):
-                    hi = mid
-                else:
-                    lo = mid
-            ph = predict_pos(t_row["x"], t_row["y"], t_row["radius"], False, w, hi)
-            return ph[0], ph[1], True, hi
-    return None
-
-
-def _path_blocked(s, tx, ty, n, w, comet_paths, rows, tgt_id, T):
-    """True if the straight flight to (tx, ty) would hit a planet OTHER than
-    the target before arrival (env: collision when the path comes within the
-    planet's radius; moving planets sweep fleets they catch).
-
-    Static blockers: exact segment-to-point check. Moving blockers (orbiting
-    planets / comets): sampled every half turn along the flight, against their
-    PREDICTED positions at that time. Best-effort: very fast small objects can
-    in principle slip between samples, but the margin covers normal cases.
-    """
-    sx, sy = s["x"], s["y"]
-    dx, dy = tx - sx, ty - sy
-    dist = math.hypot(dx, dy)
-    if dist < 1e-9:
-        return False
-    ux, uy = dx / dist, dy / dist
-    spd = fleet_speed(n)
-    off = s["radius"] + 0.1
-    margin = 0.5
-
-    movers = []
-    for r in rows:
-        if r["id"] == s["id"] or r["id"] == tgt_id:
-            continue
-        if r["comet"] or is_orbiting(r["x"], r["y"], r["radius"], False):
-            movers.append(r)
-        else:
-            if seg_point_dist(sx, sy, tx, ty, r["x"], r["y"]) < r["radius"] + margin:
-                return True
-    if movers:
-        k = 0.5
-        while k <= T + 0.5:
-            fx = sx + (off + spd * k) * ux
-            fy = sy + (off + spd * k) * uy
-            for r in movers:
-                p = target_pos_at(r, k, w, comet_paths)
-                if p is None:
-                    continue
-                if math.hypot(fx - p[0], fy - p[1]) < r["radius"] + margin:
-                    return True
-            k += 0.5
-    return False
 
 
 def _aimed_move(s, t, n, w, comet_paths, rows):
-    """Solve the intercept, sun check, and path clearance for a launch
-    s -> t of n ships. Returns [[id, angle, n]] or [] if invalid/suicidal."""
-    sol = _solve_intercept(s, t, n, w, comet_paths)
-    if sol is None:
+    angle = compute_attack_angle(s, t, n, rows, w, comet_paths=comet_paths)
+    if angle is None:
         return []
-    tx, ty, moving, T = sol
-
-    # Sun check (README: fleets crossing the sun are destroyed).
-    dx, dy = tx - s["x"], ty - s["y"]
-    dist = math.hypot(dx, dy)
-    if dist < 1e-9:
-        return []
-    if moving:
-        ex, ey = tx + 30.0 * dx / dist, ty + 30.0 * dy / dist  # overshoot buffer
-    else:
-        ex, ey = tx, ty
-    if seg_point_dist(s["x"], s["y"], ex, ey, CX, CY) < SUN_R + SUN_MARGIN:
-        return []
-
-    # Lane check: don't fly into a planet that isn't the intended target.
-    if _path_blocked(s, tx, ty, n, w, comet_paths, rows, t["id"], T):
-        return []
-
-    angle = math.atan2(dy, dx)
     return [[int(s["id"]), float(angle), int(n)]]
 
 

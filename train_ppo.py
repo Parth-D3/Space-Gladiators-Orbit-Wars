@@ -98,6 +98,76 @@ class TorchPolicy(nn.Module):
         return Cat(logits=src_l), Cat(logits=tgt_l), Cat(logits=frac_l), value
 
 
+# ---------------------------- self-play opponent ----------------------------
+
+def _greedy_opponent(model, device, auto_defend=True, overflow_cap=300):
+    @torch.no_grad()
+    def agent(obs):
+        P, G, sm, tm, aux = F.encode(obs)
+        if not aux["has_src"]:
+            return []
+
+        tP = torch.as_tensor(P, device=device).unsqueeze(0)
+        tG = torch.as_tensor(G, device=device).unsqueeze(0)
+        src_l, tgt_l, frac_l, _ = model.trunk(tP, tG)
+
+        sl = src_l.squeeze(0).cpu().numpy()
+        tl = tgt_l.squeeze(0).cpu().numpy()
+        fl = frac_l.squeeze(0).cpu().numpy()
+
+        sl = np.where(sm, sl, -1e9)
+        tl = np.where(tm, tl, -1e9)
+
+        moves = []
+        f_order = list(np.argsort(-fl))
+        if f_order[0] != 0:
+            s_order = list(np.argsort(-sl))[:3]
+            t_order = list(np.argsort(-tl))[:6]
+            fracs = [f for f in f_order if f != 0][:2]
+            found = False
+            for f_i in fracs:
+                for s_i in s_order:
+                    if sl[s_i] <= -1e8:
+                        break
+                    for t_i in t_order:
+                        if tl[t_i] <= -1e8:
+                            break
+                        mv = F.decode_action(aux, int(s_i), int(t_i), int(f_i))
+                        if mv:
+                            moves.extend(mv)
+                            found = True
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+
+        if auto_defend:
+            moves += F.auto_defend(aux)
+        if overflow_cap:
+            moves += F.overflow_attack(aux, cap=overflow_cap)
+        return moves
+
+    return agent
+
+
+def _make_strong_opponent():
+    from sota_agents.strong_agent.main import ProducerLiteRuntime
+    from sota_agents.strong_agent.orbit_lite.adapter import (
+        single_obs_to_tensor,
+        sparse_action_row_to_moves,
+    )
+    runtime = ProducerLiteRuntime()
+    def agent(obs):
+        player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
+        player_id = int(player)
+        obs_tensors = single_obs_to_tensor(obs, player_id=player_id)
+        with torch.no_grad():
+            sparse_row = runtime.tensor_action(obs_tensors)
+        return sparse_action_row_to_moves(sparse_row, obs, player_id=player_id)
+    return agent
+
+
 # ------------------------------ environment ---------------------------------
 
 class Game:
@@ -114,6 +184,8 @@ class Game:
         self.opponent = opponent
         self.seat = seat   # None = random, else fixed seat index
         self.players = players
+        self.planets_captured_ep = 0
+        self.planets_lost_ep = 0
 
     def reset(self):
         if self.players in (2, 4):
@@ -131,20 +203,117 @@ class Game:
         m, o = F.totals(obs)
         self.prev_diff = m - o
         self.last_obs = obs
+        self.planets_captured_ep = 0
+        self.planets_lost_ep = 0
         return obs
 
     def step(self, moves):
         obs, _env_reward, done, _info = self.trainer.step(moves)
-        self.last_obs = obs
+        extra = 0.0
+
+        if self.last_obs is not None:
+            pv, pr, _, _, _, _ = F.parse(self.last_obs)
+            cv, cr, _, _, _, _ = F.parse(obs)
+
+            prev_cids = {r["id"] for r in pr if r["comet"]}
+            curr_cids = {r["id"] for r in cr if r["comet"]}
+            ships_lost = sum(r["ships"] for r in pr
+                             if r["id"] in (prev_cids - curr_cids)
+                             and r["owner"] == pv)
+            if ships_lost > 0:
+                extra -= ships_lost / 50.0
+
+            prev_own = {r["id"] for r in pr if r["owner"] == pv}
+            curr_own = {r["id"] for r in cr if r["owner"] == cv}
+            for r in cr:
+                if r["id"] in (curr_own - prev_own):
+                    extra += 0.25 + 0.05 * r["prod"]
+                    self.planets_captured_ep += 1
+
+            for r in pr:
+                if r["id"] in (prev_own - curr_own) and not r["comet"]:
+                    extra -= 0.25 + 0.05 * r["prod"] + r["ships"] / 100.0
+                    self.planets_lost_ep += 1
+
+            pmp = sum(r["prod"] for r in pr if r["owner"] == pv)
+            pop = sum(r["prod"] for r in pr if r["owner"] not in (-1, pv))
+            cmp_ = sum(r["prod"] for r in cr if r["owner"] == cv)
+            cop = sum(r["prod"] for r in cr if r["owner"] not in (-1, cv))
+            extra += 0.001 * ((cmp_ - cop) - (pmp - pop))
+
         m, o = F.totals(obs)
         diff = m - o
-        reward = (diff - self.prev_diff) / 200.0
+        reward = (diff - self.prev_diff) / 200.0 + extra
         self.prev_diff = diff
+        self.last_obs = obs
         outcome = 0
         if done:
             outcome = 1 if m > o else (-1 if m < o else 0)
             reward += 3.0 * outcome
         return obs, reward, done, outcome
+
+
+class SelfPlayGame(Game):
+    def __init__(self, model, device, seat=None, players="mix",
+                 auto_defend=True, overflow_cap=300):
+        self.model = model
+        self.device = device
+        self.seat = seat
+        self.players = players
+        self.auto_defend = auto_defend
+        self.overflow_cap = overflow_cap
+        self._opp_fn = _greedy_opponent(model, device, auto_defend, overflow_cap)
+        self.planets_captured_ep = 0
+        self.planets_lost_ep = 0
+
+    def reset(self):
+        if self.players in (2, 4):
+            n = self.players
+        else:
+            n = random.choice([2, 4])
+        self.num_players = n
+        seat = self.seat if self.seat is not None else random.randrange(n)
+        seat = seat % n
+        agents = [self._opp_fn] * n
+        agents[seat] = None
+        self.env = make("orbit_wars", debug=False)
+        self.trainer = self.env.train(agents)
+        obs = self.trainer.reset()
+        m, o = F.totals(obs)
+        self.prev_diff = m - o
+        self.last_obs = obs
+        self.planets_captured_ep = 0
+        self.planets_lost_ep = 0
+        return obs
+
+
+class StrongAgentGame(Game):
+    def __init__(self, seat=None, players="mix"):
+        self.seat = seat
+        self.players = players
+        self.planets_captured_ep = 0
+        self.planets_lost_ep = 0
+
+    def reset(self):
+        if self.players in (2, 4):
+            n = self.players
+        else:
+            n = random.choice([2, 4])
+        self.num_players = n
+        seat = self.seat if self.seat is not None else random.randrange(n)
+        seat = seat % n
+        opp_fn = _make_strong_opponent()
+        agents = [opp_fn] * n
+        agents[seat] = None
+        self.env = make("orbit_wars", debug=False)
+        self.trainer = self.env.train(agents)
+        obs = self.trainer.reset()
+        m, o = F.totals(obs)
+        self.prev_diff = m - o
+        self.last_obs = obs
+        self.planets_captured_ep = 0
+        self.planets_lost_ep = 0
+        return obs
 
 
 # ------------------------------ rollout -------------------------------------
@@ -156,6 +325,11 @@ class Runner:
         self.overflow_cap = overflow_cap
         self.results = collections.deque(maxlen=50)
         self.ep_returns = collections.deque(maxlen=50)
+        self.planets_captured = collections.deque(maxlen=50)
+        self.planets_lost = collections.deque(maxlen=50)
+        self.blocked_launches = collections.deque(maxlen=50)
+        self.launch_attempts = 0
+        self.blocked_count = 0
         self.ep_ret = 0.0
         self.episodes = 0
         self.state = F.encode(self.game.reset())
@@ -176,11 +350,31 @@ class Runner:
             logp = (ds.log_prob(a_s) + dt_.log_prob(a_t) + df.log_prob(a_f)).item()
 
             moves = F.decode_action(aux, int(a_s), int(a_t), int(a_f))
+            if aux.get("has_src", False) and int(a_f) > 0 and not moves:
+                self.blocked_count += 1
+            self.launch_attempts += 1
             if self.auto_defend:
                 moves = moves + F.auto_defend(aux)
             if self.overflow_cap:
                 moves = moves + F.overflow_attack(aux, cap=self.overflow_cap)
             obs, rew, done, outcome = self.game.step(moves)
+
+            rows = aux.get("rows", [])
+            if moves and int(a_t) < len(rows):
+                tgt = rows[int(a_t)]
+                if tgt.get("comet", False):
+                    pp = aux.get("comet_paths", {}).get(tgt["id"])
+                    if pp is not None:
+                        path, idx = pp
+                        turns_left = len(path) - 1 - idx
+                        if turns_left < 5:
+                            src = rows[int(a_s)]
+                            avail = int(src["ships"])
+                            frac = F.FRACS[int(a_f)]
+                            n = max(1, avail - 1) if frac >= 0.999 else max(1, int(frac * avail))
+                            n = min(n, avail)
+                            rew -= n * max(0.0, 1.0 - turns_left / 5.0) / 200.0
+
             self.ep_ret += rew
 
             B["P"].append(P); B["G"].append(G); B["sm"].append(sm); B["tm"].append(tm)
@@ -191,11 +385,17 @@ class Runner:
             if done:
                 self.results.append(outcome)
                 self.ep_returns.append(self.ep_ret)
+                self.planets_captured.append(self.game.planets_captured_ep)
+                self.planets_lost.append(self.game.planets_lost_ep)
                 self.ep_ret = 0.0
                 self.episodes += 1
                 obs = self.game.reset()
             self.state = F.encode(obs)
 
+        blk = self.blocked_count / max(self.launch_attempts, 1)
+        self.blocked_launches.append(blk)
+        self.blocked_count = 0
+        self.launch_attempts = 0
         tP, tG, tsm, ttm = self._tensors(self.state)
         _, _, _, v_last = self.model.dists(tP, tG, tsm, ttm)
         return B, v_last.item()
@@ -266,8 +466,17 @@ def evaluate(weights_path, opponent, n_games, players="mix", auto_defend=True, o
     policy = F.NumpyPolicy(np.load(weights_path))
     w = d = l = 0
     diffs = []
+    if opponent == "sniper":
+        opp_path = "sniper.py"
+        opp_label = "sniper.py"
+    elif opponent.startswith("file:"):
+        opp_path = opponent.split(":", 1)[1]
+        opp_label = opp_path
+    else:
+        opp_path = opponent
+        opp_label = opponent
     for i in range(n_games):
-        game = Game(opponent, seat=i, players=players)  # seat rotates (mod n)
+        game = Game(opp_path, seat=i, players=players)
         obs = game.reset()
         done = False
         outcome = 0
@@ -281,7 +490,7 @@ def evaluate(weights_path, opponent, n_games, players="mix", auto_defend=True, o
         print(f"game {i + 1}/{n_games} ({game.num_players}p): "
               f"{'WIN' if outcome == 1 else 'LOSS' if outcome == -1 else 'DRAW'}"
               f"  my={m:.0f} best_opp={o:.0f}")
-    print(f"\nvs {opponent}: {w} wins / {d} draws / {l} losses "
+    print(f"\nvs {opp_label}: {w} wins / {d} draws / {l} losses "
           f"(winrate {w / max(n_games, 1):.0%}, mean ship diff {np.mean(diffs):+.1f})")
 
 
@@ -300,8 +509,8 @@ def parse_args():
     ap.add_argument("--vcoef", type=float, default=0.5)
     ap.add_argument("--ecoef", type=float, default=0.01)
     ap.add_argument("--max-grad-norm", type=float, default=0.5)
-    ap.add_argument("--opponent", type=str, default="sniper.py",
-                    help="opponent agent file (default: the repo's nearest-planet sniper)")
+    ap.add_argument("--opponent", type=str, default="sniper",
+                    help="'sniper', 'selfplay', 'strong', or 'file:<path>' (default: sniper)")
     ap.add_argument("--players", type=str, default="mix", choices=["2", "4", "mix"],
                     help="2 = 1v1, 4 = 1v3, mix = random per episode (default)")
     ap.add_argument("--no-auto-defend", action="store_true",
@@ -338,11 +547,24 @@ def main():
         print(f"resumed from {resume_path}")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    runner = Runner(Game(args.opponent, players=players), model, device,
+    opp = args.opponent
+    if opp == "selfplay":
+        game = SelfPlayGame(model, device, players=players,
+                            auto_defend=auto_defend, overflow_cap=args.overflow_cap)
+        opp_label = "selfplay (greedy)"
+    elif opp == "strong":
+        game = StrongAgentGame(players=players)
+        opp_label = "strong_agent"
+    else:
+        path = opp.split(":", 1)[1] if opp.startswith("file:") else "sniper.py"
+        game = Game(path, players=players)
+        opp_label = path
+
+    runner = Runner(game, model, device,
                     auto_defend=auto_defend, overflow_cap=args.overflow_cap)
     steps, update = 0, 0
     t0 = time.time()
-    print(f"training on {device} vs '{args.opponent}' | players={args.players} "
+    print(f"training on {device} vs '{opp_label}' | players={args.players} "
           f"| auto_defend={auto_defend} "
           f"({sum(p.numel() for p in model.parameters()):,} params)")
 
@@ -361,6 +583,9 @@ def main():
         res = list(runner.results)
         winrate = (sum(1 for r in res if r == 1) / len(res)) if res else float("nan")
         mean_ret = np.mean(runner.ep_returns) if runner.ep_returns else float("nan")
+        cap = np.mean(runner.planets_captured) if runner.planets_captured else float("nan")
+        lost = np.mean(runner.planets_lost) if runner.planets_lost else float("nan")
+        blk = np.mean(runner.blocked_launches) if runner.blocked_launches else float("nan")
         sps = steps / (time.time() - t0)
         pbar.set_postfix(upd=update, win=f"{winrate:.0%}" if not math.isnan(winrate) else "N/A",
                          ret=f"{mean_ret:+.2f}" if not math.isnan(mean_ret) else "N/A",
@@ -368,8 +593,9 @@ def main():
                          sps=f"{sps:,.0f}")
         pbar.update(args.rollout)
         print(f"upd {update:4d} | steps {steps:>8,} | eps {runner.episodes:4d} "
-              f"| winrate(last{len(res)}) {winrate:5.0%} | ep_ret {mean_ret:+7.2f} "
-              f"| pi {pl:+.3f} v {vl:.3f} ent {ent:.2f} | {sps:,.0f} steps/s")
+              f"| win(last{len(res)}) {winrate:5.0%} | ret {mean_ret:+7.2f} "
+              f"| cap {cap:.2f} lost {lost:.2f} lane {blk:.1%} "
+              f"| pi {pl:+.3f} v {vl:.3f} ent {ent:.2f} | {sps:,.0f} s/s")
 
     pbar.close()
     print(f"done. saved {args.ckpt} and {args.out}")
