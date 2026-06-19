@@ -102,10 +102,14 @@ def score_candidates(
     player_count: int,
     launches: LaunchSet,
     player_id: int,
+    scorer: callable = None,
+    step_frac: float = 0.0,
 ) -> Tensor:
     """Competitive score per candidate. ``[C]`` (or scalar if no candidate axis).
 
-    Uses the sparse exact flow projector.
+    Uses the sparse exact flow projector.  When *scorer* is provided it is
+    called with the flow diff and auxiliary context instead of the hand-crafted
+    ``competitive_score``.
     """
     diff = sparse_launch_flow_delta(
         status,
@@ -115,6 +119,8 @@ def score_candidates(
         launches=launches,
         player_id=int(player_id),
     )
+    if scorer is not None:
+        return scorer.score_candidates(diff, launches, prod, status, step_frac, int(player_id))
     return competitive_score(diff, player_id=int(player_id))
 
 
@@ -371,11 +377,16 @@ def reachable_mask(
 def _greedy_select(
     *, P, W, device, dtype, score, cand_src, cand_send, cand_angle, cand_eta,
     cand_active, cand_tgt_slot, cand_tgt_short, cand_is_def, source_budget,
-    target_exists, roi_threshold,
-) -> LaunchEntries:
+    target_exists, roi_threshold, stochastic=False, temperature=1.0,
+):
     """Masking-only greedy over [C, L] candidates: pick the best wave each iter,
     one per target, source-budget aware across all L contributors. Enforces the
-    role mutex: a reinforced planet can't also be a source, and vice-versa."""
+    role mutex: a reinforced planet can't also be a source, and vice-versa.
+
+    When *stochastic* is True (training mode), candidates are sampled from
+    ``softmax(score / temperature)`` instead of greedy argmax, and the
+    returned tuple includes per-wave log-probabilities.
+    """
     C, L = int(cand_src.shape[0]), int(cand_src.shape[1])
     target_taken = ~target_exists.clone()                                        # [T]
     defended = torch.zeros(P, dtype=torch.bool, device=device)                   # reinforced this turn
@@ -387,6 +398,7 @@ def _greedy_select(
     w_eta = torch.ones(W, L, dtype=dtype, device=device)
     w_tgt = torch.zeros(W, L, dtype=torch.long, device=device)
     w_active = torch.zeros(W, L, dtype=torch.bool, device=device)
+    log_probs: list[Tensor] = []
 
     for w in range(W):
         taken_cand = target_taken[cand_tgt_short]                               # [C]
@@ -398,8 +410,17 @@ def _greedy_select(
         contrib_defended = (defended[cand_src] & cand_active).any(dim=-1)       # [C]
         mask = torch.isfinite(score) & ~taken_cand & can_fund & ~tgt_used_as_src & ~contrib_defended
         masked = torch.where(mask, score, torch.full_like(score, float("-inf")))
-        best_c = _stable_argmax(masked)                                         # scalar, device-stable
-        best_score = masked[best_c]
+
+        if stochastic:
+            probs = torch.softmax(masked / float(temperature), dim=-1)
+            dist = torch.distributions.Categorical(probs)
+            best_c = dist.sample()
+            best_score = masked[best_c]
+            log_probs.append(dist.log_prob(best_c))
+        else:
+            best_c = _stable_argmax(masked)                                         # scalar, device-stable
+            best_score = masked[best_c]
+
         fired = bool(torch.isfinite(best_score) & (best_score > roi_threshold))
         if not fired:
             break
@@ -439,7 +460,7 @@ def _greedy_select(
         eta=torch.where(w_active, w_eta, torch.ones_like(w_eta)).reshape(WL),
         valid=w_active.reshape(WL),
     )
-    return entries, source_budget   # source_budget = leftover ships per planet
+    return entries, source_budget, log_probs   # source_budget = leftover ships per planet
 
 
 def _plan_regroup(

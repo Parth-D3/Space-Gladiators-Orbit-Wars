@@ -45,6 +45,7 @@ from orbit_lite.planner_core import (
 )
 from orbit_lite.adapter import single_obs_to_tensor, sparse_action_row_to_moves
 
+
 TOTAL_STEPS = 500
 
 
@@ -137,6 +138,8 @@ def _tier_candidates(
     player_count: int,
     device,
     dtype,
+    scorer=None,
+    step_frac: float = 0.0,
 ):
     """Build scored candidates for one fleet-size fraction."""
     sizes = (drain.view(S, 1) * float(size_mult)).floor().clamp(min=1.0).expand(S, T)
@@ -193,6 +196,7 @@ def _tier_candidates(
     score = score_candidates(
         garrison_status, prod=prod, alive_by_step=alive_by_step,
         player_count=int(player_count), launches=launches, player_id=pid,
+        scorer=scorer, step_frac=step_frac,
     )
     score = torch.where(cand_valid, score, torch.full_like(score, float("-inf")))
     return cand_src, cand_send, cand_angle, cand_eta, cand_active, cand_tgt_slot, cand_tgt_short, cand_is_def, score
@@ -209,6 +213,10 @@ def plan_lite_waves(
     alive_by_step: Tensor,
     config: ProducerLiteConfig,
     player_count: int,
+    scorer=None,
+    stochastic: bool = False,
+    temperature: float = 1.0,
+    step_frac: float = 0.0,
 ):
     P = obs.P
     device = obs.device
@@ -222,7 +230,7 @@ def plan_lite_waves(
 
     source_mask = obs.owned & obs.alive & (obs.ships >= float(config.min_ships_to_launch))
     if not bool(source_mask.any()):
-        return _empty_entries(device, dtype)
+        return _empty_entries(device, dtype), []
 
     S_cap = max(1, min(int(config.max_sources_per_lane), P))
     source_idx, source_exists = _candidate_indices(obs.ships, source_mask, S_cap)
@@ -231,7 +239,7 @@ def plan_lite_waves(
         config=config, K_eta=K_eta, H=H, prod=prod, source_mask=source_mask,
     )
     if not bool(target_exists.any()):
-        return _empty_entries(device, dtype)
+        return _empty_entries(device, dtype), []
     S = int(source_idx.shape[0])
     T = int(target_idx.shape[0])
     target_is_mine = obs.owned[target_idx.clamp(0, P - 1)]
@@ -285,6 +293,8 @@ def plan_lite_waves(
             player_count=player_count,
             device=device,
             dtype=dtype,
+            scorer=scorer,
+            step_frac=step_frac,
         )
         for mult in config.size_multipliers
     ]
@@ -299,16 +309,17 @@ def plan_lite_waves(
     cand_is_def = torch.cat([p[7] for p in tier_parts], dim=0)
     score = torch.cat([p[8] for p in tier_parts], dim=0)
 
-    wave_entries, leftover = _greedy_select(
+    wave_entries, leftover, log_probs = _greedy_select(
         P=P, W=W, device=device, dtype=dtype, score=score,
         cand_src=cand_src, cand_send=cand_send, cand_angle=cand_angle, cand_eta=cand_eta,
         cand_active=cand_active, cand_tgt_slot=cand_tgt_slot, cand_tgt_short=cand_tgt_short,
         cand_is_def=cand_is_def, source_budget=obs.ships.to(dtype).clone(),
         target_exists=target_exists, roi_threshold=float(config.roi_threshold),
+        stochastic=stochastic, temperature=temperature,
     )
 
     if not bool(config.enable_regroup):
-        return wave_entries
+        return wave_entries, log_probs
     if enemy_mass is None:
         enemy_mass = cheap_enemy_pressure(obs, cache, horizon=float(K_eta), player_id=pid)
     regroup_entries = _plan_regroup(
@@ -316,10 +327,11 @@ def plan_lite_waves(
         leftover=leftover, original_ships=obs.ships.to(dtype), pressure=enemy_mass,
         config=config, H=H,
     )
-    return concat_launch_entries([wave_entries, regroup_entries])
+    return concat_launch_entries([wave_entries, regroup_entries]), log_probs
 
 
-def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int, memory) -> dict:
+def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int, memory,
+             scorer=None, stochastic: bool = False, temperature: float = 1.0) -> dict:
     device = obs_tensors["planets"].device
     obs = parse_obs(obs_tensors)
     P = obs.P
@@ -336,12 +348,18 @@ def run_turn(obs_tensors: dict, *, config: ProducerLiteConfig, player_count: int
     H = int(config.horizon)
     status = movement.garrison_status(max_horizon=H)
     alive_by_step = movement.alive_by_step[: H + 1]
+    total_steps = int(obs_tensors.get("episode_steps", obs_tensors.get("step", 500)).reshape(-1)[0].item())
+    step = int(obs.step.reshape(-1)[0].item())
+    step_frac = float(step) / max(float(total_steps), 1.0)
 
-    entries = plan_lite_waves(
+    entries, log_probs = plan_lite_waves(
         movement=movement, obs=obs, obs_tensors=obs_tensors, cache=cache,
         garrison_status=status, prod=movement.planet_prod,
         alive_by_step=alive_by_step, config=config, player_count=int(player_count),
+        scorer=scorer, stochastic=stochastic, temperature=temperature, step_frac=step_frac,
     )
+    if stochastic and memory is not None:
+        memory.episode_log_probs.extend(log_probs)
     entries = disambiguate_duplicate_launches(entries)
     launches = infer_planned_launches_from_entries(
         obs_tensors=obs_tensors, movement=movement, entries=entries, player_id=int(obs.player_id),
@@ -413,16 +431,23 @@ class ProducerLiteMemory:
         self.movement = None
         self.cached_player_count: int | None = None
         self.last_sparse_action_row: dict | None = None
+        self.episode_log_probs: list = []
 
     def reset(self) -> None:
         self.movement = None
         self.cached_player_count = None
         self.last_sparse_action_row = None
+        self.episode_log_probs = []
 
 
 class ProducerLiteRuntime:
-    def __init__(self, memory: ProducerLiteMemory | None = None) -> None:
+    def __init__(self, memory: ProducerLiteMemory | None = None,
+                 scorer=None, stochastic: bool = False,
+                 temperature: float = 1.0) -> None:
         self.memory = memory if memory is not None else ProducerLiteMemory()
+        self.scorer = scorer
+        self.stochastic = stochastic
+        self.temperature = temperature
 
     def reset(self) -> None:
         self.memory.reset()
@@ -442,6 +467,8 @@ class ProducerLiteRuntime:
         row = run_turn(
             obs_tensors, config=config,
             player_count=int(mem.cached_player_count), memory=mem,
+            scorer=self.scorer, stochastic=self.stochastic,
+            temperature=self.temperature,
         )
         mem.last_sparse_action_row = row
         return row

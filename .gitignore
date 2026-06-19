@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# PyTorch model weights
+*.pt
+*.pth
+
+# Submission archives
+*.tar.gz
+
+# Generated replays
+replay.json
+
+# Search-generated params
+params.json
