@@ -75,7 +75,7 @@ class ProducerLiteConfig:
     terminal_max_waves_per_turn: int = 8
     terminal_enable_regroup: bool = False
     # --- exp41: evaluate several commit fractions per (src, tgt) ------------
-    size_multipliers: tuple[float, ...] = (0.5, 0.75, 1.0)
+    size_multipliers: tuple[float, ...] = (0.5, 1.0)
 
 
 def _movement_config(config: ProducerLiteConfig, *, player_count: int) -> MovementConfig:
